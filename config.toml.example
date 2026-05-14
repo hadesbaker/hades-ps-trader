@@ -4,49 +4,60 @@ wallet_path = "wallet.json"
 
 # Trading Configuration
 [trading]
-# Maximum slippage tolerance (percentage)
-max_slippage = 20.0 # 20%
-# Maximum amount to spend on a single buy (in lamports)
+# Slippage tolerance (percentage) — starting value. Sells escalate from here
+# up to +95% in 5% steps to avoid bag-holding.
+max_slippage = 10.0
+# Lamports per buy. Each MACD bullish crossover spends this much.
 trade_amount = 250_000_000  # 0.25 SOL
-# Priority fee per buy (in SOL). Required by PumpPortal /api/trade-local.
+# Priority fee per tx (in SOL). Required by PumpPortal /api/trade-local.
 priority_fee_sol = 0.0005
-# Take profit percentage
-profit_target_percent = 10.0
-# Stop loss percentage
-stop_loss_percent = 25.0
-# Maximum number of concurrent positions
+# Maximum number of concurrent OPEN positions across ALL monitored tokens.
+# A token in its monitoring window without an open trade does NOT consume a
+# slot — so the bot can monitor many tokens at once while only ever holding
+# this many at any moment.
 max_positions = 3
 # RPC-side rebroadcast retries for buy / sell tx
-buy_tx_retries = 2
-sell_tx_retries = 2
-# How often (ms) the position monitor reads the PumpSwap pool's vaults
-# directly over RPC to compute price. Each read = one getMultipleAccounts
-# call. Faster = more responsive trailing stops, more RPC load.
-price_poll_interval_ms = 3000
-# Emit a `PNL MONITOR` info line every N successful price ticks. 0 disables it.
+buy_tx_retries = 5
+sell_tx_retries = 5
+# How often (ms) the price feed reads the PumpSwap pool's vaults via a single
+# getMultipleAccounts call. Each read feeds the candle aggregator.
+price_poll_interval_ms = 500
+# Emit a `PNL MONITOR` info line every N successful price ticks while a
+# position is open. 0 disables it (per-tick debug log is unaffected).
 pnl_log_every_n_ticks = 5
-# Maximum seconds to hold a position. Timer starts the moment the buy tx is
-# confirmed on-chain. 0 disables (positions held until SL/TP/trail fires).
-max_hold_time = 3600  # 1 hour
-# Dynamic trailing stop: "gain%:trail%" pairs, comma-separated
-# When peak PnL crosses a gain tier, exit if it drops trail% from peak
-dynamic_trailing_stop_thresholds = "12:7,20:10,40:10,80:20,120:25"
+# Total seconds to monitor a single token after graduation. Within this window
+# the bot may buy and sell that token any number of times based on MACD
+# signals. When the window expires, no new buys; any open position is
+# force-sold using the standard sell flow before the session ends.
+# 0 = monitor indefinitely (until the process exits).
+max_monitor_time = 3600  # 1 hour
+
+# MACD Configuration
+[macd]
+# Candle (bar) timeframe in seconds. MACD runs on candle closes.
+# Smaller = more signals + more noise. Larger = fewer, cleaner signals + longer
+# warmup. Note: warmup needs (slow + signal) candles before any signals fire.
+candle_interval_secs = 60  # 1m candles
+# Classic MACD periods (12 / 26 / 9). EMAs are seeded with an SMA of the first
+# `period` values, then updated with the standard k = 2/(period+1) formula.
+fast = 12
+slow = 26
+signal = 9
+# Minimum seconds between a sell and the next buy on the same token. Filters
+# out whipsaw re-entries on noisy crossovers. Set 0 to disable.
+cooldown_secs = 30
 
 # Trading Filters
-# Set enabled = false to disable all filters
-# Set any value to 0 to disable that specific filter
+# Run ONCE at graduation, before monitoring starts. If a filter fails, the
+# token is not monitored at all.
+# Set enabled = false to skip every check. Set any individual value to 0 to
+# disable just that check.
 [tradingfilters]
-enabled = true
+enabled = false
 min_holders = 100
 min_txs = 250
 # Reject if the combined balance of the top 10 holders (excluding the PumpSwap
-# pool base vault and the pump.fun bonding-curve PDA) exceeds this fraction of
-# total supply. Units are FRACTION, not percent: 0.05 = 5%, 0.30 = 30%.
+# pool's base vault and the pump.fun bonding-curve PDA) exceeds this fraction
+# of total supply. Units are FRACTION, not percent: 0.05 = 5%, 0.30 = 30%.
 # Set 0 to disable.
 top_ten_holder_percentage = 0.30
-# Pre-buy rug guard. During the `timer` window after filters pass, the bot
-# watches PumpSwap price. If price drops by more than this fraction from the
-# first observable price, the buy is aborted. Fraction in [0, 1]: 0.60 = abort
-# on >60% drop. Set 0 to disable.
-rug_percentage = 0.60
-timer = 180 # seconds

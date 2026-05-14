@@ -1,51 +1,52 @@
-# hades-ps-sniper
+# hades-ps-trader
 
-A Rust bot that listens for pump.fun → PumpSwap token graduations in real time, gates each candidate behind on-chain filters (holder count + bonding-curve trade history), waits a configurable timer, snipes the buy via PumpPortal, and exits the position based on a dynamic trailing-stop ladder.
+A Rust bot that listens for pump.fun → PumpSwap token graduations in real time, opens a per-token monitoring session, and trades the token over its monitoring window using a configurable MACD strategy. Each session can buy and sell the same token any number of times based on MACD crossovers.
 
-> **Warning — this bot moves real money.** Test with `--dry-run` first. Set `trade_amount` to a small value when you go live. There is no recovery for positions held when the process dies.
+> **Warning — this bot moves real money.** Test with `--dry-run` first. Set `trade_amount` to a small value when you go live. Any position open at session end is force-sold via the standard sell flow.
 
 ## Features
 
 - Real-time graduation feed via PumpPortal `subscribeMigration`
-- On-chain filters using your own Solana RPC (no third-party indexers required)
-  - Holder count via `getProgramAccounts` (SPL Token, mint-filtered, non-zero balances)
-  - Trade count via `getSignaturesForAddress` on the pump.fun bonding-curve PDA
-- Pre-buy timer (`tradingfilters.timer`)
+- Per-graduation MACD trading session
+  - Candle aggregator built from polled PumpSwap pool prices (no third-party indexers, no candle data subscription)
+  - Classic MACD (configurable fast / slow / signal EMAs) on candle closes
+  - Buy on bullish crossover, sell on bearish crossover
+  - Cooldown between trades to filter whipsaw re-entries
+  - No pyramiding — at most one open trade per token at a time
+- Concurrency cap (`max_positions`) on open positions across all monitored tokens
+- `max_monitor_time` per-token monitoring window; any open position is force-sold before the session ends
+- Optional one-shot on-chain trading filters at graduation (holders, bonding-curve activity, top-10 concentration)
 - Buy + sell via PumpPortal `/api/trade-local` (locally signed, you keep custody)
-- `send_transaction_with_config` with configurable RPC rebroadcast retries and explicit on-chain confirmation polling
-- Direct PumpSwap pool reads for per-position price tracking — one `getMultipleAccounts` per poll, no third-party indexers, no premium WS subscriptions
-- Three exit triggers, first to fire wins:
-  - Hard stop loss
-  - Hard take profit
-  - Dynamic trailing stop (peak-aware, multi-tier)
-- Concurrency cap (`max_positions`)
+- `send_transaction_with_config` with RPC rebroadcast retries and explicit on-chain confirmation polling
+- Slippage escalation on tx failure (buy: up to +10%, sell: up to +95% to avoid bag-holding)
+- Direct PumpSwap pool reads for per-token price tracking — one `getMultipleAccounts` per poll
 - Optional Discord webhook notifications on buy / sell / orphan-position events
 - Auto-reconnect on WS drops with exponential backoff
 
 ## Prerequisites
 
-| Tool                   | Version                                                           | Why                                                                |
-| ---------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------ |
-| Rust                   | 1.85+ (edition 2024)                                              | Required by `edition = "2024"` in `Cargo.toml`                     |
-| A Solana mainnet RPC   | any HTTP endpoint that supports `getProgramAccounts` with filters | QuickNode, Helius, Triton, etc. The free public RPC will not work. |
-| A PumpPortal account   | free                                                              | API key optional, recommended for a stable migration WS subscription |
-| A funded Solana wallet | small balance to start                                            | Used as both the trader and the signer                             |
-| A Discord webhook URL  | optional                                                          | Buy / sell / orphan notifications, off when blank                 |
+| Tool                   | Version                                                              | Why                                                                |
+| ---------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Rust                   | 1.85+ (edition 2024)                                                 | Required by `edition = "2024"` in `Cargo.toml`                     |
+| A Solana mainnet RPC   | any HTTP endpoint that supports `getProgramAccounts` with filters    | QuickNode, Helius, Triton, etc. The free public RPC will not work. |
+| A PumpPortal account   | free                                                                 | API key optional, recommended for a stable migration WS subscription |
+| A funded Solana wallet | small balance to start                                               | Used as both the trader and the signer                             |
+| A Discord webhook URL  | optional                                                             | Buy / sell / orphan notifications, off when blank                  |
 
 ## Setup
 
 ```bash
 # 1. Clone
-git clone <your-fork-url> hades-ps-sniper
-cd hades-ps-sniper
+git clone <your-fork-url> hades-ps-trader
+cd hades-ps-trader
 
 # 2. Environment
 cp .env.example .env
 # edit .env:
 #   SOLANA_RPC_URL=https://...your-rpc...       (required)
-#   DISCORD_WEBHOOK_URL=https://discord...       (optional — enables buy/sell notifications when set)
-#   PUMPPORTAL_API_KEY=...                       (optional — recommended for stable WS)
-#   RUST_LOG=info                                (set to "debug" to see per-tick price polls)
+#   DISCORD_WEBHOOK_URL=https://discord...       (optional)
+#   PUMPPORTAL_API_KEY=...                       (optional, recommended for stable WS)
+#   RUST_LOG=info                                (set to "debug" to see per-tick price polls and bar updates)
 
 # 3. Config
 cp config.toml.example config.toml
@@ -89,86 +90,99 @@ CLI flags:
 - `--dry-run` — skip every buy and sell tx submission, log what would have been sent. Discord notifications are also suppressed in dry-run.
 - `--config <path>` — alternate config file (default `config.toml`)
 
-Logs are controlled by `RUST_LOG` (defaults to `info`, can be set in `.env`). Use `RUST_LOG=debug` to see every price poll tick and PnL update; use `RUST_LOG=hades_ps_sniper=debug` to keep upstream crates (solana-client, reqwest) quiet.
+Logs are controlled by `RUST_LOG` (defaults to `info`, can be set in `.env`). Use `RUST_LOG=debug` to see every price poll, candle close, and MACD update; use `RUST_LOG=hades_ps_trader=debug` to keep upstream crates (solana-client, reqwest) quiet.
 
 ## Configuration
 
 `config.toml`:
 
-| Key                                        | Example                           | Purpose                                                                                                                  |
-| ------------------------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `wallet_path`                              | `"wallet.json"`                   | Path to Solana CLI keypair JSON                                                                                          |
-| `trading.trade_amount`                     | `250_000_000`                     | Lamports per buy (0.25 SOL)                                                                                              |
-| `trading.max_slippage`                     | `20.0`                            | Slippage tolerance % for buy and sell                                                                                    |
-| `trading.priority_fee_sol`                 | `0.0005`                          | Priority fee per tx in SOL                                                                                               |
-| `trading.profit_target_percent`            | `10.0`                            | Hard take-profit %; set `0` to disable                                                                                   |
-| `trading.stop_loss_percent`                | `25.0`                            | Hard stop-loss %; set `0` to disable                                                                                     |
-| `trading.dynamic_trailing_stop_thresholds` | `"12:7,20:10,40:10,80:20,120:25"` | Trailing tiers as `gain%:trail%` pairs. Once peak PnL crosses a tier, the bot exits if PnL drops `trail%` from the peak. |
-| `trading.max_positions`                    | `3`                               | Concurrent open positions cap                                                                                            |
-| `trading.buy_tx_retries`                   | `2`                               | RPC-side rebroadcast retries for the buy tx (`maxRetries` in `RpcSendTransactionConfig`). Bot then polls for on-chain confirmation. |
-| `trading.sell_tx_retries`                  | `2`                               | Same as above, for the sell tx.                                                                                          |
-| `trading.price_poll_interval_ms`           | `3000`                            | How often the position monitor reads the PumpSwap pool's vaults to compute price. One `getMultipleAccounts` call per tick. |
-| `trading.pnl_log_every_n_ticks`            | `5`                               | Emit a `PNL MONITOR: <mint> (TICKER) +X.XX%` info line every Nth successful price tick. Set `0` to disable (per-tick debug log unaffected). |
-| `trading.max_hold_time`                    | `3600`                            | Maximum seconds to hold a position. Timer starts the moment the buy tx is confirmed on-chain. Set `0` to disable. Takes priority over SL/TP/trail. |
-| `tradingfilters.enabled`                   | `true`                            | Gate buys behind on-chain filters                                                                                        |
-| `tradingfilters.min_holders`               | `100`                             | Minimum holders required; `0` disables this check                                                                        |
-| `tradingfilters.min_txs`                   | `250`                             | Minimum bonding-curve trade signatures required; `0` disables                                                            |
-| `tradingfilters.top_ten_holder_percentage` | `0.30`                            | Reject if combined top-10 holder balance exceeds this fraction of total supply (PumpSwap pool vault + bonding-curve PDA excluded). Fraction, not percent: `0.05` = 5%. `0` disables. |
-| `tradingfilters.rug_percentage`            | `0.60`                            | Pre-buy rug guard. During the `timer` window, the bot watches PumpSwap price; if it drops by more than this fraction from the first observable price, the buy is aborted. Fraction: `0.60` = abort on >60% drop. `0` disables. |
-| `tradingfilters.timer`                     | `180`                             | Seconds to wait after filters pass, before submitting the buy                                                            |
+### `[trading]`
 
-### Exit logic note
+| Key                              | Example       | Purpose                                                                                                                                                              |
+| -------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wallet_path`                    | `"wallet.json"` | Path to Solana CLI keypair JSON (top-level key, not under `[trading]`)                                                                                             |
+| `trading.max_slippage`           | `10.0`        | Starting slippage tolerance %. Sells escalate up to +95% in 5% steps; buys escalate up to +10%.                                                                       |
+| `trading.trade_amount`           | `250_000_000` | Lamports per buy (0.25 SOL). Each MACD bullish crossover spends this.                                                                                                |
+| `trading.priority_fee_sol`       | `0.0005`      | Priority fee per tx in SOL                                                                                                                                            |
+| `trading.max_positions`          | `3`           | Concurrent OPEN positions cap across all monitored tokens. A monitored token without an open trade does NOT consume a slot.                                          |
+| `trading.buy_tx_retries`         | `5`           | RPC-side rebroadcast retries for the buy tx (`maxRetries` in `RpcSendTransactionConfig`). Bot then polls for on-chain confirmation.                                  |
+| `trading.sell_tx_retries`        | `5`           | Same as above, for the sell tx.                                                                                                                                       |
+| `trading.price_poll_interval_ms` | `500`         | How often the price feed reads the PumpSwap pool's vaults to compute price. Each read = one `getMultipleAccounts`. Each tick feeds the candle aggregator.            |
+| `trading.pnl_log_every_n_ticks`  | `5`           | Emit a `PNL MONITOR: <mint> (TICKER) +X.XX%` info line every Nth price tick while a position is open. Set `0` to disable (per-tick debug log unaffected).            |
+| `trading.max_monitor_time`       | `3600`        | Total seconds to monitor a single token after graduation. Within this window the bot may buy and sell that token any number of times. When the window expires, no new buys; any open position is force-sold. Set `0` to monitor indefinitely. |
 
-Four exit signals run simultaneously, **first to fire wins** — `max_hold_time`, stop loss, take profit, and dynamic trailing stop. `max_hold_time` takes priority over the others when both would fire on the same tick: if the timer has expired we exit, period, regardless of PnL. If `profit_target_percent` is below the lowest trailing tier, TP triggers first and trailing never engages. The bot prints a `WARN` at startup if it detects this. To rely on trailing exits, either raise `profit_target_percent` above the highest tier or set it to `0`. Any of `stop_loss_percent`, `profit_target_percent`, or `max_hold_time` can be set to `0` to disable that one signal.
+### `[macd]`
+
+| Key                         | Example | Purpose                                                                                                                                       |
+| --------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `macd.candle_interval_secs` | `60`    | Candle (bar) timeframe. MACD runs on candle closes. Smaller = more signals + more noise; larger = fewer, cleaner signals + longer warmup.    |
+| `macd.fast`                 | `12`    | Fast EMA period.                                                                                                                              |
+| `macd.slow`                 | `26`    | Slow EMA period.                                                                                                                              |
+| `macd.signal`               | `9`     | Signal-line EMA period (EMA of the MACD line itself).                                                                                         |
+| `macd.cooldown_secs`        | `30`    | Minimum seconds between a sell and the next buy on the same token. Filters whipsaw re-entries on noisy crossovers. Set `0` to disable.        |
+
+### `[tradingfilters]`
+
+Run **once** at graduation, before monitoring starts. If a filter fails, the token is not monitored at all.
+
+| Key                                        | Example   | Purpose                                                                                                                                                                                                  |
+| ------------------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tradingfilters.enabled`                   | `false`   | Master switch. `false` skips every check.                                                                                                                                                                |
+| `tradingfilters.min_holders`               | `100`     | Minimum holders required; `0` disables this check.                                                                                                                                                       |
+| `tradingfilters.min_txs`                   | `250`     | Minimum bonding-curve trade signatures required (page-walked up to 5000, then capped); `0` disables.                                                                                                     |
+| `tradingfilters.top_ten_holder_percentage` | `0.30`    | Reject if combined top-10 holder balance exceeds this fraction of total supply (PumpSwap pool vault + bonding-curve PDA excluded). Fraction in [0, 1]: `0.05` = 5%. `0` disables.                       |
 
 ## How it works
 
 ```
 graduation event (PumpPortal subscribeMigration)
-  -> filter: holder_count >= min_holders
-  -> filter: bonding_curve_tx_count >= min_txs
-  -> filter: top10_concentration <= top_ten_holder_percentage
-  -> sleep tradingfilters.timer seconds
-       (concurrent rug-watch: aborts buy if price drops > rug_percentage
-        from the first observable PumpSwap price during the window)
-  -> reserve a position slot (capped at max_positions)
-  -> buy via /api/trade-local
-       send_transaction_with_config (max_retries = buy_tx_retries)
-       poll get_signature_statuses at "confirmed" until landed
-  -> read post-buy token balance
-       primary:  derived ATA at "confirmed" commitment
-       fallback: getTokenAccountsByOwner filtered by mint
-       wide retry window so finalization lag can't orphan the position
-  -> derive entry price = trade_amount_sol / tokens_received
-  -> Discord: BUY embed (mint, spent SOL, tokens, entry price, pump.fun link)
-  -> discover PumpSwap pool once (cached): pool_id, base_vault, quote_vault
-  -> price poll loop, every price_poll_interval_ms:
-       1× getMultipleAccounts(base_vault, quote_vault)
-       price  = (quote_lamports / 1e9) / (base_raw / 1e6)
-       pct    = (price - entry) / entry * 100
-       peak   = max(peak, pct)
-       decide: max_hold_time | stop_loss | take_profit | dynamic_trail
-       if triggered -> sell_all (amount="100%"), confirm, release slot
-  -> Discord: SELL embed (reason, PnL %, net return SOL)
+  -> optional one-shot filters: holder_count, bonding-curve tx count, top-10 concentration
+       any fail -> token not monitored
+  -> spawn per-token MACD session:
+       price-poll task reads PumpSwap pool every price_poll_interval_ms
+       each tick feeds the candle aggregator (bar = candle_interval_secs)
+       on each candle close, MACD updates fast / slow / signal EMAs
+       on bullish crossover:
+         - already in a trade on this token?    -> skip (no pyramiding)
+         - inside cooldown_secs of last sell?   -> skip
+         - max_positions full?                  -> skip, keep watching
+         - else                                 -> reserve slot, buy
+                                                   resolve fill via ATA (with by-mint scan fallback)
+                                                   Discord: BUY embed
+       on bearish crossover:
+         - no open trade?                       -> skip
+         - else                                 -> sell ALL (amount="100%"), release slot, record sell time
+                                                   Discord: SELL embed
+  -> max_monitor_time elapsed:
+       stop accepting new signals
+       any open position is force-sold via the standard sell flow
+       session ends
 ```
+
+Notes:
+
+- **MACD warmup** needs `slow + signal` candles before any signals can fire. At defaults (60s × 35 bars) that is ~35 minutes. The bot prints a `WARN` at startup if the warmup consumes ≥50% of `max_monitor_time`.
+- **No pyramiding.** At most one open trade per token at any time. A bullish crossover while already holding is ignored.
+- **Cooldown** is applied only after a sell, not after the first buy in a session.
+- **`max_positions` only counts open positions.** Monitoring many tokens simultaneously is fine; the cap kicks in only when a buy would push you past it.
+- **Force-sell on session end** uses the full slippage-escalation chain (up to +95%). If even that fails, the bot logs loudly and exits — the position remains on-chain and must be sold manually.
 
 ## Project structure
 
 ```
 src/
-  main.rs          orchestrator + CLI
-  config.rs        typed loader for config.toml
-  wallet.rs        load Keypair from Solana CLI JSON
-  pumpportal.rs    subscribeMigration WS feed (graduations)
-  pumpswap.rs      PumpSwap pool discovery + vault price math
-  price_feed.rs    polling loop driving per-position price updates
-  onchain.rs       RPC helpers: holder count, bonding-curve tx count, ATA balance (with fallback scan)
-  trader.rs        PumpPortal /api/trade-local: buy + sell_all + send-and-confirm
-  position.rs      Position state, trail tier parsing, exit decision
-  monitor_pos.rs   per-position monitor + exit evaluator
-  rug_watch.rs     pre-buy rug guard, racing against the tradingfilters.timer
-  sniper.rs        per-graduation handler tying it all together
-  discord.rs       optional webhook notifier (buy / sell / orphan-position alerts)
+  main.rs        orchestrator + CLI
+  config.rs      typed loader for config.toml
+  wallet.rs      load Keypair from Solana CLI JSON
+  pumpportal.rs  subscribeMigration WS feed (graduations)
+  pumpswap.rs    PumpSwap pool discovery + vault price math
+  price_feed.rs  polling loop driving per-token price updates
+  macd.rs        EMA, MACD indicator, candle aggregator, crossover detector
+  onchain.rs     RPC helpers: holder count, bonding-curve tx count, ATA balance (with fallback scan), top-10 concentration, Metaplex / Token-2022 metadata
+  trader.rs      PumpPortal /api/trade-local: buy + sell_all + send-and-confirm with slippage escalation
+  position.rs    Position state
+  session.rs     per-graduation MACD trading session (filters, candle loop, buy/sell, force-exit)
+  discord.rs     optional webhook notifier (buy / sell / orphan-position alerts)
 ```
 
 ## Author
