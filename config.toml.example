@@ -1,0 +1,52 @@
+# Wallet Configuration
+wallet_path = "wallet.json"
+# Generate a new wallet with: solana-keygen new --outfile wallet.json
+
+# Trading Configuration
+[trading]
+# Maximum slippage tolerance (percentage)
+max_slippage = 20.0 # 20%
+# Maximum amount to spend on a single buy (in lamports)
+trade_amount = 250_000_000  # 0.25 SOL
+# Priority fee per buy (in SOL). Required by PumpPortal /api/trade-local.
+priority_fee_sol = 0.0005
+# Take profit percentage
+profit_target_percent = 10.0
+# Stop loss percentage
+stop_loss_percent = 25.0
+# Maximum number of concurrent positions
+max_positions = 3
+# RPC-side rebroadcast retries for buy / sell tx
+buy_tx_retries = 2
+sell_tx_retries = 2
+# How often (ms) the position monitor reads the PumpSwap pool's vaults
+# directly over RPC to compute price. Each read = one getMultipleAccounts
+# call. Faster = more responsive trailing stops, more RPC load.
+price_poll_interval_ms = 3000
+# Emit a `PNL MONITOR` info line every N successful price ticks. 0 disables it.
+pnl_log_every_n_ticks = 5
+# Maximum seconds to hold a position. Timer starts the moment the buy tx is
+# confirmed on-chain. 0 disables (positions held until SL/TP/trail fires).
+max_hold_time = 3600  # 1 hour
+# Dynamic trailing stop: "gain%:trail%" pairs, comma-separated
+# When peak PnL crosses a gain tier, exit if it drops trail% from peak
+dynamic_trailing_stop_thresholds = "12:7,20:10,40:10,80:20,120:25"
+
+# Trading Filters
+# Set enabled = false to disable all filters
+# Set any value to 0 to disable that specific filter
+[tradingfilters]
+enabled = true
+min_holders = 100
+min_txs = 250
+# Reject if the combined balance of the top 10 holders (excluding the PumpSwap
+# pool base vault and the pump.fun bonding-curve PDA) exceeds this fraction of
+# total supply. Units are FRACTION, not percent: 0.05 = 5%, 0.30 = 30%.
+# Set 0 to disable.
+top_ten_holder_percentage = 0.30
+# Pre-buy rug guard. During the `timer` window after filters pass, the bot
+# watches PumpSwap price. If price drops by more than this fraction from the
+# first observable price, the buy is aborted. Fraction in [0, 1]: 0.60 = abort
+# on >60% drop. Set 0 to disable.
+rug_percentage = 0.60
+timer = 180 # seconds
