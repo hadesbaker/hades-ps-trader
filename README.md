@@ -3,6 +3,8 @@
 A Rust bot that listens for pump.fun → PumpSwap token graduations in real time, opens a per-token monitoring session, and trades the token over its monitoring window using a configurable MACD strategy. Each session can buy and sell the same token any number of times based on MACD crossovers.
 
 > **Warning — this bot moves real money.** Test with `--dry-run` first. Set `trade_amount` to a small value when you go live. Any position open at session end is force-sold via the standard sell flow.
+>
+> **⚠️ Educational use only — see the [Disclaimer](#disclaimer) before running this software.**
 
 ## Features
 
@@ -185,10 +187,22 @@ src/
   discord.rs     optional webhook notifier (buy / sell / orphan-position alerts)
 ```
 
+## Disclaimer
+
+**This software is provided for educational and informational purposes only.**
+
+- **Not financial advice.** Nothing in this repository — code, comments, documentation, or examples — constitutes financial, investment, trading, legal, or tax advice. It is a technical demonstration of automated trading concepts.
+- **Use entirely at your own risk.** Cryptocurrency trading is extremely high risk. Automated trading of newly graduated pump.fun tokens is especially speculative and you should assume you can lose **100% of any funds the bot has access to**. Never run this bot with money you cannot afford to lose entirely.
+- **No warranty.** This software is provided "AS IS", without warranty of any kind, express or implied. It may contain bugs, may execute trades incorrectly, may fail to sell a position, and may lose money — including through software defects, network or RPC failures, slippage, or adverse market conditions.
+- **No liability.** To the maximum extent permitted by law, the author(s) and contributors shall not be liable for any claim, damages, or other liability — including but not limited to any financial losses, lost profits, or lost funds — arising from or in connection with the use of, or inability to use, this software.
+- **You are solely responsible** for how you use this software, for securing your wallet and private keys, for any funds placed at risk, and for complying with all laws, regulations, and third-party terms of service (including those of pump.fun, PumpSwap, PumpPortal, and your RPC provider) applicable in your jurisdiction.
+
+By using, running, modifying, or distributing this software, you acknowledge that you have read and understood this disclaimer and accept full responsibility for the outcomes.
+
 ## Author
 
 **Taki Hades Baker Alyasri**
 
 ## License
 
-MIT
+MIT — see the [Disclaimer](#disclaimer) above. The MIT license's "AS IS", no-warranty, and no-liability terms apply to all use of this software.
