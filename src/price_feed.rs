@@ -13,6 +13,8 @@ use tokio::time::{sleep, Duration};
 #[derive(Debug, Clone, Copy)]
 pub struct PriceUpdate {
     pub price_sol: f64,
+    /// WSOL liquidity in the pool's quote vault at the time of this read.
+    pub pool_sol: f64,
 }
 
 /// Spawn a background task that discovers the mint's PumpSwap pool, then
@@ -47,15 +49,19 @@ pub fn spawn_price_poll(
 
         let mut consecutive_failures: u32 = 0;
         loop {
-            match pumpswap::fetch_price_sol(&rpc, &pool).await {
-                Ok(price) => {
+            match pumpswap::fetch_pool_state(&rpc, &pool).await {
+                Ok(state) => {
                     if consecutive_failures >= 5 {
                         info!(
                             "[{mint}] price poll recovered after {consecutive_failures} failures"
                         );
                     }
                     consecutive_failures = 0;
-                    if tx.send(PriceUpdate { price_sol: price }).is_err() {
+                    let update = PriceUpdate {
+                        price_sol: state.price_sol,
+                        pool_sol: state.pool_sol,
+                    };
+                    if tx.send(update).is_err() {
                         debug!("[{mint}] price poll: receiver dropped");
                         return;
                     }

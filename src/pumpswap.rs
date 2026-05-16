@@ -123,8 +123,18 @@ pub async fn find_pool(rpc: &RpcClient, mint: &Pubkey) -> Result<PoolInfo, BoxEr
     Ok(PoolInfo { pool_id, base_vault, quote_vault })
 }
 
-/// Fetch SOL-per-display-token price. One `getMultipleAccounts` call.
-pub async fn fetch_price_sol(rpc: &RpcClient, pool: &PoolInfo) -> Result<f64, BoxError> {
+/// A single read of a PumpSwap pool's vaults.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolState {
+    /// SOL per display-token (UI units).
+    pub price_sol: f64,
+    /// WSOL liquidity held in the pool's quote vault, in SOL.
+    pub pool_sol: f64,
+}
+
+/// Read a PumpSwap pool's price and quote-side liquidity. One
+/// `getMultipleAccounts` call covers both vaults.
+pub async fn fetch_pool_state(rpc: &RpcClient, pool: &PoolInfo) -> Result<PoolState, BoxError> {
     let accounts = tokio::time::timeout(
         Duration::from_millis(500),
         rpc.get_multiple_accounts(&[pool.base_vault, pool.quote_vault]),
@@ -157,7 +167,7 @@ pub async fn fetch_price_sol(rpc: &RpcClient, pool: &PoolInfo) -> Result<f64, Bo
         return Err("PumpSwap base vault is zero".into());
     }
 
-    let price_sol = (quote_amount as f64 / SOL_DECIMAL_FACTOR)
-        / (base_amount as f64 / BASE_DECIMAL_FACTOR);
-    Ok(price_sol)
+    let pool_sol = quote_amount as f64 / SOL_DECIMAL_FACTOR;
+    let price_sol = pool_sol / (base_amount as f64 / BASE_DECIMAL_FACTOR);
+    Ok(PoolState { price_sol, pool_sol })
 }

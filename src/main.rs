@@ -6,6 +6,7 @@ mod position;
 mod price_feed;
 mod pumpportal;
 mod pumpswap;
+mod rug;
 mod session;
 mod trader;
 mod wallet;

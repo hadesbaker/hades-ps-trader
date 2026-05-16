@@ -61,3 +61,28 @@ min_txs = 250
 # of total supply. Units are FRACTION, not percent: 0.05 = 5%, 0.30 = 30%.
 # Set 0 to disable.
 top_ten_holder_percentage = 0.30
+
+# Pre-Buy Rug Detection
+# Evaluated on every bullish crossover, right before a buy would fire, using
+# the price + pool-liquidity history gathered since the session started. A
+# failing check skips just that buy; the session keeps monitoring, so a later
+# signal can still buy if the token recovers. Independent of [tradingfilters]
+# (which run once at graduation) — this runs continuously, per candidate buy.
+# If this whole section is omitted, the defaults below apply (guard enabled).
+[rug]
+# Master switch. false = never block a buy.
+enabled = true
+# Minimum WSOL liquidity (in SOL) the PumpSwap pool must hold to allow a buy.
+# A pulled-liquidity rug drains this toward zero. TUNE THIS to the typical
+# healthy pool size of freshly graduated tokens. Set 0 to disable this check.
+min_pool_sol = 5.0
+# Skip the buy if pool liquidity is down more than this % from its session
+# peak (liquidity actively being removed). Set 0 to disable.
+max_liquidity_drop_pct = 50.0
+# Skip the buy if price is down more than this % from the session high — the
+# token already pumped and dumped ("the price just sits there"). Set 0 to
+# disable.
+max_drawdown_pct = 70.0
+# Minimum price samples gathered before the guard will clear any buy. At
+# price_poll_interval_ms=500 a sample is ~0.5s, so 20 ≈ 10s of history.
+min_samples = 20

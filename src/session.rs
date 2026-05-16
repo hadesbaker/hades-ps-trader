@@ -4,8 +4,8 @@
 //!   1. Run trading filters (if enabled) once at graduation. Reject → no session.
 //!   2. Spawn the price-poll task and start aggregating candles.
 //!   3. On each candle close, feed the close to MACD.
-//!        - Bullish crossover, no open position, cooldown elapsed, slot
-//!          available → buy.
+//!        - Bullish crossover, no open position, rug guard clear, cooldown
+//!          elapsed, slot available → buy.
 //!        - Bearish crossover with an open position → sell.
 //!   4. When `max_monitor_time` elapses, stop accepting new signals and
 //!      force-sell any open position before returning.
@@ -18,6 +18,7 @@ use crate::onchain;
 use crate::position::Position;
 use crate::price_feed;
 use crate::pumpportal::MigrationEvent;
+use crate::rug::RugGuard;
 use crate::trader::{self, BuyParams, SellAllParams};
 use log::{debug, error, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -114,6 +115,7 @@ async fn run_session(
     let mut last_sell_at: Option<Instant> = None;
     let mut last_price: Option<f64> = None;
     let mut tick: u64 = 0;
+    let mut rug_guard = RugGuard::new();
 
     let deadline_fut = async {
         if let Some(d) = deadline {
@@ -137,8 +139,10 @@ async fn run_session(
                     break;
                 };
                 let price = update.price_sol;
+                let pool_sol = update.pool_sol;
                 last_price = Some(price);
                 tick += 1;
+                rug_guard.observe(price, pool_sol);
 
                 if let Some(pos) = &position {
                     if pnl_log_every > 0 && tick % pnl_log_every == 0 {
@@ -174,6 +178,10 @@ async fn run_session(
                             Crossover::Bullish => {
                                 if position.is_some() {
                                     debug!("[{tag}] bullish ignored: already in position");
+                                } else if let Some(reason) =
+                                    rug_guard.check(&cfg.rug, price, pool_sol)
+                                {
+                                    info!("[{tag}] bullish skipped: RUG GUARD — {reason}");
                                 } else if let Some(t) = last_sell_at {
                                     let since = now.duration_since(t);
                                     if since < cooldown {

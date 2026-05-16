@@ -9,6 +9,10 @@ pub struct Config {
     pub trading: Trading,
     pub macd: Macd,
     pub tradingfilters: TradingFilters,
+    /// Pre-buy rug guard. If the whole `[rug]` section is omitted, defaults
+    /// apply (the guard is enabled).
+    #[serde(default)]
+    pub rug: RugFilter,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -50,6 +54,45 @@ pub struct TradingFilters {
     /// PumpSwap pool's base vault and the pump.fun bonding-curve PDA) exceeds
     /// this fraction of total supply. Fraction in [0, 1]. 0 disables.
     pub top_ten_holder_percentage: f64,
+}
+
+/// Pre-buy rug detection. Evaluated on every bullish crossover, just before a
+/// buy would fire, against the price + pool-liquidity history gathered since
+/// the session started. A failing check blocks that one buy; the session keeps
+/// monitoring, so a later signal can still buy if the token recovers.
+///
+/// Independent of [`TradingFilters`], which run once at graduation — this runs
+/// continuously, per candidate buy. Missing fields fall back to the defaults
+/// below, so a partial `[rug]` section is valid.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RugFilter {
+    /// Master switch. `false` → never block a buy.
+    pub enabled: bool,
+    /// Minimum WSOL liquidity (in SOL) the PumpSwap pool must hold to allow a
+    /// buy. A pulled-liquidity rug drains this toward zero. 0 disables.
+    pub min_pool_sol: f64,
+    /// Block the buy if pool liquidity is down more than this percent from its
+    /// session peak (liquidity actively being removed). 0 disables.
+    pub max_liquidity_drop_pct: f64,
+    /// Block the buy if price is down more than this percent from the session
+    /// high (token already pumped and dumped). 0 disables.
+    pub max_drawdown_pct: f64,
+    /// Minimum price samples gathered before the guard will clear a buy.
+    /// Avoids judging a token on a near-empty history.
+    pub min_samples: u32,
+}
+
+impl Default for RugFilter {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_pool_sol: 5.0,
+            max_liquidity_drop_pct: 50.0,
+            max_drawdown_pct: 70.0,
+            min_samples: 20,
+        }
+    }
 }
 
 impl Config {
