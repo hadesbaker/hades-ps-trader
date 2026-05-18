@@ -63,6 +63,18 @@ async fn main() -> Result<(), BoxError> {
         }
     }
 
+    // A take-profit that fires before the lowest trailing tier engages means
+    // trailing stops can never run — flag it.
+    if cfg.trading.profit_target_percent > 0.0
+        && cfg.trading.profit_target_percent
+            < first_tier_gain(&cfg.trading.dynamic_trailing_stop_thresholds)
+    {
+        warn!(
+            "profit_target_percent={} fires below the lowest trailing tier — trailing stops will never engage. Raise or set to 0 to disable.",
+            cfg.trading.profit_target_percent
+        );
+    }
+
     if args.dry_run {
         warn!("--dry-run is ON: buys and sells will not be submitted");
     }
@@ -77,6 +89,12 @@ async fn main() -> Result<(), BoxError> {
         rpc_url,
         CommitmentConfig::confirmed(),
     ));
+
+    // Starting wallet balance — the baseline for a run's gross PnL.
+    match onchain::fetch_sol_balance(&rpc, &keypair.pubkey()).await {
+        Ok(sol) => info!("wallet balance: {sol:.5} SOL"),
+        Err(e) => warn!("could not fetch starting wallet balance: {e}"),
+    }
 
     let ws_url = match std::env::var("PUMPPORTAL_API_KEY") {
         Ok(k) if !k.is_empty() => format!("wss://pumpportal.fun/api/data?api-key={k}"),
@@ -135,4 +153,12 @@ async fn main() -> Result<(), BoxError> {
 
     error!("PumpPortal listener channel closed; exiting.");
     Ok(())
+}
+
+/// Lowest `gain%` among the configured trailing-stop tiers, or +∞ if none.
+fn first_tier_gain(s: &str) -> f64 {
+    position::parse_tiers(s)
+        .first()
+        .map(|t| t.gain_pct)
+        .unwrap_or(f64::INFINITY)
 }

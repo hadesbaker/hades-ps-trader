@@ -15,7 +15,7 @@ use crate::discord::Notifier;
 use crate::macd::{CandleAggregator, Crossover, Macd, MacdEvent};
 
 use crate::onchain;
-use crate::position::Position;
+use crate::position::{self, Position};
 use crate::price_feed;
 use crate::pumpportal::MigrationEvent;
 use crate::rug::RugGuard;
@@ -25,8 +25,8 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
@@ -43,7 +43,11 @@ pub async fn handle(
     event: MigrationEvent,
     dry_run: bool,
 ) {
-    let MigrationEvent { mint: mint_str, name, symbol } = event;
+    let MigrationEvent {
+        mint: mint_str,
+        name,
+        symbol,
+    } = event;
     let tag = short(&mint_str);
     let mint = match Pubkey::from_str(&mint_str) {
         Ok(p) => p,
@@ -76,8 +80,18 @@ pub async fn handle(
     );
 
     run_session(
-        cfg, http, rpc, keypair, open_positions, notifier,
-        mint, mint_str, name, symbol, tag, dry_run,
+        cfg,
+        http,
+        rpc,
+        keypair,
+        open_positions,
+        notifier,
+        mint,
+        mint_str,
+        name,
+        symbol,
+        tag,
+        dry_run,
     )
     .await;
 }
@@ -110,6 +124,7 @@ async fn run_session(
     let mut rx = price_feed::spawn_price_poll(rpc.clone(), mint_str.clone(), poll_interval);
     let mut aggregator = CandleAggregator::new(candle_interval);
     let mut macd = Macd::new(cfg.macd.fast, cfg.macd.slow, cfg.macd.signal);
+    let tiers = position::parse_tiers(&cfg.trading.dynamic_trailing_stop_thresholds);
 
     let mut position: Option<Position> = None;
     let mut last_sell_at: Option<Instant> = None;
@@ -144,15 +159,47 @@ async fn run_session(
                 tick += 1;
                 rug_guard.observe(price, pool_sol);
 
-                if let Some(pos) = &position {
+                // PnL-based exit — evaluated on every price tick while a
+                // position is open: stop-loss, take-profit, dynamic trailing
+                // stop, max_hold_time. Mirrors hades-ps-sniper's monitor.
+                let exit = if let Some(pos) = position.as_mut() {
+                    let pct = pos.pnl_pct(price);
+                    pos.update_peak(pct);
                     if pnl_log_every > 0 && tick % pnl_log_every == 0 {
                         info!(
-                            "PNL MONITOR: {} {:+.2}%",
-                            display_label(&mint_str, symbol.as_deref()),
-                            pos.pnl_pct(price)
+                            "PNL MONITOR: {} {pct:+.2}%",
+                            display_label(&mint_str, symbol.as_deref())
                         );
                     }
+                    let elapsed_secs = pos.bought_at.elapsed().as_secs();
+                    position::decide_exit(pos, pct, elapsed_secs, &cfg.trading, &tiers)
+                        .map(|reason| (reason, pct, pos.peak_pct))
+                } else {
+                    None
+                };
+                if let Some((reason, pct, peak)) = exit {
+                    let pos = position.take().expect("position present for exit");
+                    info!(
+                        "[{tag}] EXIT: {} (price={price:.10} pnl={pct:+.2}% peak={peak:+.2}%)",
+                        reason.display()
+                    );
+                    match try_sell(
+                        &cfg, &http, &rpc, &keypair, &notifier,
+                        &pos, pct, &reason.display(), &tag, dry_run,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            open_positions.fetch_sub(1, Ordering::SeqCst);
+                            last_sell_at = Some(Instant::now());
+                        }
+                        Err(_) => {
+                            warn!("[{tag}] sell failed — keeping position open for next tick");
+                            position = Some(pos);
+                        }
+                    }
                 }
+
                 debug!("[{tag}] tick price={:.10}", price);
 
                 let now = Instant::now();
@@ -206,26 +253,11 @@ async fn run_session(
                                 }
                             }
                             Crossover::Bearish => {
-                                if let Some(pos) = position.take() {
-                                    let pct = pos.pnl_pct(price);
-                                    match try_sell(
-                                        &cfg, &http, &rpc, &keypair, &notifier,
-                                        &pos, pct, "MACD bearish crossover", &tag, dry_run,
-                                    ).await {
-                                        Ok(()) => {
-                                            open_positions.fetch_sub(1, Ordering::SeqCst);
-                                            last_sell_at = Some(Instant::now());
-                                        }
-                                        Err(_) => {
-                                            warn!(
-                                                "[{tag}] sell failed — keeping position open for next signal"
-                                            );
-                                            position = Some(pos);
-                                        }
-                                    }
-                                } else {
-                                    debug!("[{tag}] bearish ignored: no open position");
-                                }
+                                // Exits are PnL-driven (stop-loss / take-profit
+                                // / trailing stop / max_hold_time), evaluated
+                                // per price tick. A bearish MACD crossover no
+                                // longer triggers a sell.
+                                debug!("[{tag}] bearish crossover — no action (PnL-driven exits)");
                             }
                         }
                     }
@@ -239,9 +271,19 @@ async fn run_session(
         let pct = last_price.map(|p| pos.pnl_pct(p)).unwrap_or(0.0);
         warn!("[{tag}] session ending with open position — force-selling");
         match try_sell(
-            &cfg, &http, &rpc, &keypair, &notifier,
-            &pos, pct, "Forced exit (max_monitor_time)", &tag, dry_run,
-        ).await {
+            &cfg,
+            &http,
+            &rpc,
+            &keypair,
+            &notifier,
+            &pos,
+            pct,
+            "Forced exit (max_monitor_time)",
+            &tag,
+            dry_run,
+        )
+        .await
+        {
             Ok(()) => {
                 open_positions.fetch_sub(1, Ordering::SeqCst);
             }
@@ -286,7 +328,9 @@ async fn try_buy(
 
     let amount_sol = cfg.trading.trade_amount as f64 / LAMPORTS_PER_SOL as f64;
     let buy_res = trader::buy(
-        http, rpc, keypair,
+        http,
+        rpc,
+        keypair,
         BuyParams {
             mint: mint_str,
             symbol,
@@ -312,6 +356,8 @@ async fn try_buy(
             return None;
         }
     };
+    // max_hold_time clock starts the moment the buy tx confirms.
+    let bought_at = Instant::now();
 
     let balance = match onchain::fetch_token_balance(
         rpc,
@@ -329,7 +375,12 @@ async fn try_buy(
                  buy tx: {sig}. Sell manually."
             );
             notifier.notify_orphan_buy(
-                mint_str, name, symbol, &sig.to_string(), amount_sol, &e.to_string(),
+                mint_str,
+                name,
+                symbol,
+                &sig.to_string(),
+                amount_sol,
+                &e.to_string(),
             );
             open_positions.fetch_sub(1, Ordering::SeqCst);
             return None;
@@ -347,7 +398,14 @@ async fn try_buy(
     info!(
         "[{tag}] BOUGHT: {token_ui} tokens @ {entry_price_sol:.10} SOL/token (cost ~{amount_sol} SOL)"
     );
-    notifier.notify_buy(mint_str, name, symbol, amount_sol, token_ui, entry_price_sol);
+    notifier.notify_buy(
+        mint_str,
+        name,
+        symbol,
+        amount_sol,
+        token_ui,
+        entry_price_sol,
+    );
 
     Some(Position {
         mint: mint_str.to_string(),
@@ -355,6 +413,8 @@ async fn try_buy(
         symbol: symbol.map(str::to_string),
         entry_price_sol,
         cost_sol: amount_sol,
+        peak_pct: 0.0,
+        bought_at,
     })
 }
 
@@ -372,7 +432,9 @@ async fn try_sell(
     dry_run: bool,
 ) -> Result<(), crate::config::BoxError> {
     let res = trader::sell_all(
-        http, rpc, keypair,
+        http,
+        rpc,
+        keypair,
         SellAllParams {
             mint: &pos.mint,
             symbol: pos.symbol.as_deref(),
@@ -388,9 +450,18 @@ async fn try_sell(
         Ok(Some(_sig)) => {
             let net_return_sol = pos.cost_sol * pct / 100.0;
             info!("[{tag}] SOLD ({reason}) pnl={pct:+.2}%");
+            // Post-sell wallet balance — lets a run's gross PnL be read off the log.
+            match onchain::fetch_sol_balance(rpc, &keypair.pubkey()).await {
+                Ok(sol) => info!("[{tag}] wallet balance: {sol:.5} SOL"),
+                Err(e) => warn!("[{tag}] could not fetch wallet balance after sell: {e}"),
+            }
             notifier.notify_sell(
-                &pos.mint, pos.name.as_deref(), pos.symbol.as_deref(),
-                reason, pct, net_return_sol,
+                &pos.mint,
+                pos.name.as_deref(),
+                pos.symbol.as_deref(),
+                reason,
+                pct,
+                net_return_sol,
             );
             Ok(())
         }

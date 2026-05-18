@@ -111,6 +111,19 @@ pub async fn holder_count(rpc: &RpcClient, mint: &Pubkey) -> Result<u64, BoxErro
     Ok(count)
 }
 
+const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+/// Current SOL balance of `pubkey`, in whole SOL. Uses "confirmed" commitment
+/// so a read right after a confirmed sell reflects the proceeds.
+pub async fn fetch_sol_balance(rpc: &RpcClient, pubkey: &Pubkey) -> Result<f64, BoxError> {
+    let lamports = rpc
+        .get_balance_with_commitment(pubkey, CommitmentConfig::confirmed())
+        .await
+        .map_err(|e| format!("get_balance {pubkey}: {e}"))?
+        .value;
+    Ok(lamports as f64 / LAMPORTS_PER_SOL)
+}
+
 pub struct TokenBalance {
     pub raw_amount: u64,
     pub decimals: u8,

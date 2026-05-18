@@ -20,6 +20,10 @@ pub struct Trading {
     pub max_slippage: f64,
     pub trade_amount: u64,
     pub priority_fee_sol: f64,
+    /// Take-profit: exit once PnL reaches this percent. 0 disables.
+    pub profit_target_percent: f64,
+    /// Hard stop-loss: exit once PnL falls to this percent loss. 0 disables.
+    pub stop_loss_percent: f64,
     /// Maximum number of concurrent OPEN positions, across all monitored tokens.
     pub max_positions: u64,
     pub buy_tx_retries: u64,
@@ -31,6 +35,13 @@ pub struct Trading {
     /// Total seconds to monitor a single token after graduation. Any open
     /// position is force-sold before the window ends. 0 = monitor indefinitely.
     pub max_monitor_time: u64,
+    /// Maximum seconds to hold a single open position before exiting it on the
+    /// standard sell flow. Timer starts when the buy tx confirms. 0 disables.
+    pub max_hold_time: u64,
+    /// Dynamic trailing stop: comma-separated `gain%:trail%` tiers. Once peak
+    /// PnL crosses a tier's gain, the position exits if PnL drops `trail%` from
+    /// its peak. E.g. `"20:8,40:13"`.
+    pub dynamic_trailing_stop_thresholds: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

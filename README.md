@@ -1,6 +1,6 @@
 # hades-ps-trader
 
-A Rust bot that listens for pump.fun → PumpSwap token graduations in real time, opens a per-token monitoring session, and trades the token over its monitoring window using a configurable MACD strategy. Each session can buy and sell the same token any number of times based on MACD crossovers.
+A Rust bot that listens for pump.fun → PumpSwap token graduations in real time, opens a per-token monitoring session, and trades the token over its monitoring window. It **enters** positions on a configurable MACD crossover strategy and **exits** them on a PnL-based rule set — hard stop-loss, take-profit, dynamic trailing stop, and a max-hold-time cap. Each session can buy and sell the same token any number of times within its monitoring window.
 
 > **Warning — this bot moves real money.** Test with `--dry-run` first. Set `trade_amount` to a small value when you go live. Any position open at session end is force-sold via the standard sell flow.
 >
@@ -9,11 +9,10 @@ A Rust bot that listens for pump.fun → PumpSwap token graduations in real time
 ## Features
 
 - Real-time graduation feed via PumpPortal `subscribeMigration`
-- Per-graduation MACD trading session
-  - Candle aggregator built from polled PumpSwap pool prices (no third-party indexers, no candle data subscription)
-  - Classic MACD (configurable fast / slow / signal EMAs) on candle closes
-  - Buy on bullish crossover, sell on bearish crossover
-  - Cooldown between trades to filter whipsaw re-entries
+- Per-graduation trading session
+  - **Entry — MACD:** candle aggregator built from polled PumpSwap pool prices (no third-party indexers, no candle data subscription); classic MACD (configurable fast / slow / signal EMAs) on candle closes; buy on a bullish crossover
+  - **Exit — PnL rules:** hard stop-loss, take-profit, tiered dynamic trailing stop, and a max-hold-time cap — evaluated on every price tick while a position is open
+  - Cooldown between a sell and the next buy to filter whipsaw re-entries
   - No pyramiding — at most one open trade per token at a time
 - Concurrency cap (`max_positions`) on open positions across all monitored tokens
 - `max_monitor_time` per-token monitoring window; any open position is force-sold before the session ends
@@ -107,12 +106,16 @@ Logs are controlled by `RUST_LOG` (defaults to `info`, can be set in `.env`). Us
 | `trading.max_slippage`           | `10.0`          | Starting slippage tolerance %. Sells escalate up to +95% in 5% steps; buys escalate up to +10%.                                                                                                                                               |
 | `trading.trade_amount`           | `250_000_000`   | Lamports per buy (0.25 SOL). Each MACD bullish crossover spends this.                                                                                                                                                                         |
 | `trading.priority_fee_sol`       | `0.0005`        | Priority fee per tx in SOL                                                                                                                                                                                                                    |
+| `trading.profit_target_percent`  | `0`             | Take-profit: exit once PnL reaches this `%` gain. `0` disables it.                                                                                                                                                                            |
+| `trading.stop_loss_percent`      | `30.0`          | Hard stop-loss: exit once PnL falls to this `%` loss. `0` disables it.                                                                                                                                                                        |
 | `trading.max_positions`          | `3`             | Concurrent OPEN positions cap across all monitored tokens. A monitored token without an open trade does NOT consume a slot.                                                                                                                   |
 | `trading.buy_tx_retries`         | `5`             | RPC-side rebroadcast retries for the buy tx (`maxRetries` in `RpcSendTransactionConfig`). Bot then polls for on-chain confirmation.                                                                                                           |
 | `trading.sell_tx_retries`        | `5`             | Same as above, for the sell tx.                                                                                                                                                                                                               |
 | `trading.price_poll_interval_ms` | `500`           | How often the price feed reads the PumpSwap pool's vaults to compute price. Each read = one `getMultipleAccounts`. Each tick feeds the candle aggregator.                                                                                     |
 | `trading.pnl_log_every_n_ticks`  | `5`             | Emit a `PNL MONITOR: <mint> (TICKER) +X.XX%` info line every Nth price tick while a position is open. Set `0` to disable (per-tick debug log unaffected).                                                                                     |
 | `trading.max_monitor_time`       | `3600`          | Total seconds to monitor a single token after graduation. Within this window the bot may buy and sell that token any number of times. When the window expires, no new buys; any open position is force-sold. Set `0` to monitor indefinitely. |
+| `trading.max_hold_time`          | `900`           | Per-position cap: max seconds to hold a single open position before exiting it. Timer starts when the buy tx confirms. Distinct from `max_monitor_time` (the per-token session window). Set `0` to disable.                                    |
+| `trading.dynamic_trailing_stop_thresholds` | `"20:8,40:13"` | Tiered trailing stop. Comma-separated `gain%:trail%` pairs. Once peak PnL crosses a tier's `gain%`, the position exits if PnL drops `trail%` back from its peak. Higher tiers widen the trail so a strong runner isn't cut early.   |
 
 ### `[macd]`
 
@@ -153,22 +156,30 @@ Pre-buy rug guard. Evaluated on every bullish crossover, just before a buy fires
 graduation event (PumpPortal subscribeMigration)
   -> optional one-shot filters: holder_count, bonding-curve tx count, top-10 concentration
        any fail -> token not monitored
-  -> spawn per-token MACD session:
+  -> spawn per-token session:
        price-poll task reads PumpSwap pool every price_poll_interval_ms
-       each tick feeds the candle aggregator (bar = candle_interval_secs)
-       on each candle close, MACD updates fast / slow / signal EMAs
-       on bullish crossover:
-         - already in a trade on this token?    -> skip (no pyramiding)
-         - [rug] guard flags the token?         -> skip, keep watching
-         - inside cooldown_secs of last sell?   -> skip
-         - max_positions full?                  -> skip, keep watching
-         - else                                 -> reserve slot, buy
+
+       ENTRY — each tick feeds the candle aggregator (bar = candle_interval_secs);
+       on each candle close MACD updates its fast / slow / signal EMAs:
+         on bullish crossover:
+           - already in a trade on this token?  -> skip (no pyramiding)
+           - [rug] guard flags the token?       -> skip, keep watching
+           - inside cooldown_secs of last sell? -> skip
+           - max_positions full?                -> skip, keep watching
+           - else                               -> reserve slot, buy
                                                    resolve fill via ATA (with by-mint scan fallback)
                                                    Discord: BUY embed
-       on bearish crossover:
-         - no open trade?                       -> skip
-         - else                                 -> sell ALL (amount="100%"), release slot, record sell time
-                                                   Discord: SELL embed
+         on bearish crossover                   -> no action (exits are PnL-driven)
+
+       EXIT — while a position is open, every price tick checks (first match wins):
+         1. max_hold_time elapsed since the buy            -> sell
+         2. PnL <= -stop_loss_percent                      -> sell
+         3. PnL >= profit_target_percent                   -> sell
+         4. peak PnL crossed a trail tier and PnL has
+            since fallen trail% back from that peak        -> sell
+         on sell: sell ALL (amount="100%"), release slot, record sell time
+                  Discord: SELL embed
+
   -> max_monitor_time elapsed:
        stop accepting new signals
        any open position is force-sold via the standard sell flow
@@ -179,8 +190,11 @@ Notes:
 
 - **MACD warmup** needs `slow + signal` candles before any signals can fire. At defaults (60s × 35 bars) that is ~35 minutes. The bot prints a `WARN` at startup if the warmup consumes ≥50% of `max_monitor_time`.
 - **No pyramiding.** At most one open trade per token at any time. A bullish crossover while already holding is ignored.
+- **Exits are PnL-driven, not MACD.** A bearish MACD crossover no longer sells. An open position is closed only by the four exit rules above (checked every price tick), or by the session-end force-sell.
+- **Exit priority** is fixed: `max_hold_time` → `stop_loss` → `profit_target` → trailing stop. The first rule that trips wins. If `profit_target_percent` is set *below* the lowest trailing tier's gain, the take-profit always fires first and trailing never engages — the bot prints a `WARN` at startup if so.
 - **Cooldown** is applied only after a sell, not after the first buy in a session.
 - **`max_positions` only counts open positions.** Monitoring many tokens simultaneously is fine; the cap kicks in only when a buy would push you past it.
+- **`max_hold_time` vs `max_monitor_time`.** `max_hold_time` caps a single open position; `max_monitor_time` bounds the whole per-token session (which may open and close several positions). A position can be ended by either.
 - **Force-sell on session end** uses the full slippage-escalation chain (up to +95%). If even that fails, the bot logs loudly and exits — the position remains on-chain and must be sold manually.
 
 ## Project structure
@@ -196,8 +210,8 @@ src/
   macd.rs        EMA, MACD indicator, candle aggregator, crossover detector
   onchain.rs     RPC helpers: holder count, bonding-curve tx count, ATA balance (with fallback scan), top-10 concentration, Metaplex / Token-2022 metadata
   trader.rs      PumpPortal /api/trade-local: buy + sell_all + send-and-confirm with slippage escalation
-  position.rs    Position state
-  session.rs     per-graduation MACD trading session (filters, candle loop, buy/sell, force-exit)
+  position.rs    Position state + PnL exit rules (stop-loss / take-profit / trailing / max-hold)
+  session.rs     per-graduation session: filters, candle loop, MACD entry, PnL exit, force-exit
   discord.rs     optional webhook notifier (buy / sell / orphan-position alerts)
 ```
 

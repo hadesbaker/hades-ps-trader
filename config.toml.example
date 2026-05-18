@@ -11,6 +11,15 @@ max_slippage = 10.0
 trade_amount = 250_000_000  # 0.25 SOL
 # Priority fee per tx (in SOL). Required by PumpPortal /api/trade-local.
 priority_fee_sol = 0.0005
+# --- Position exit (PnL-driven) ---
+# Entries are MACD bullish crossovers; exits are decided by the four rules
+# below, evaluated on every price tick while a position is open. The first
+# rule that trips wins. Priority: max_hold_time > stop_loss > profit_target >
+# trailing stop.
+# Take-profit: exit once PnL reaches this percent gain. 0 disables it.
+profit_target_percent = 0
+# Hard stop-loss: exit once PnL falls to this percent loss. 0 disables it.
+stop_loss_percent = 30.0
 # Maximum number of concurrent OPEN positions across ALL monitored tokens.
 # A token in its monitoring window without an open trade does NOT consume a
 # slot — so the bot can monitor many tokens at once while only ever holding
@@ -31,6 +40,16 @@ pnl_log_every_n_ticks = 5
 # force-sold using the standard sell flow before the session ends.
 # 0 = monitor indefinitely (until the process exits).
 max_monitor_time = 3600  # 1 hour
+# Maximum seconds to hold a SINGLE open position before exiting it via the
+# standard sell flow. The timer starts when the buy tx confirms. This is a
+# per-position cap, distinct from max_monitor_time (the per-token session
+# window). Set 0 to disable.
+max_hold_time = 900  # 15 minutes
+# Dynamic trailing stop: comma-separated "gain%:trail%" tiers. Once peak PnL
+# crosses a tier's gain%, the position exits if PnL drops trail% back from its
+# peak. Higher tiers widen the trail so a strong runner isn't cut early.
+# Example: at "20:8", once peak PnL hits +20%, exit on an 8-point pullback.
+dynamic_trailing_stop_thresholds = "20:8,30:10,40:13,55:16,75:20,100:22,130:25"
 
 # MACD Configuration
 [macd]
