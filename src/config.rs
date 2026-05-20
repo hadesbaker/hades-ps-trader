@@ -13,6 +13,11 @@ pub struct Config {
     /// apply (the guard is enabled).
     #[serde(default)]
     pub rug: RugFilter,
+    /// Optional capitulation dip-buy entry mode. If the whole `[capitulation]`
+    /// section is omitted, defaults apply (the detector is DISABLED — MACD
+    /// remains the entry trigger).
+    #[serde(default)]
+    pub capitulation: CapitulationConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -102,6 +107,45 @@ impl Default for RugFilter {
             max_liquidity_drop_pct: 50.0,
             max_drawdown_pct: 70.0,
             min_samples: 20,
+        }
+    }
+}
+
+/// Capitulation dip-buy entry. Alternative to MACD: when `enabled = true`,
+/// the bot fires a buy on every tick whose price is `>= dip_pct` below the
+/// price at the start of a `window_secs` rolling window — and MACD bullish
+/// crossovers stop triggering buys (MACD candle aggregation and logging
+/// continue, but only for analysis). After firing the detector is debounced
+/// for `debounce_secs` to avoid stacking entries during a deep dump.
+///
+/// Defaults come from the `analysis/capitulation.py` sweep on test5+test6:
+/// rolling-window pct change with `dip_pct=50, window_secs=60` was the most
+/// profitable point.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CapitulationConfig {
+    /// Master switch. `false` (default) → MACD is the entry trigger and this
+    /// detector never runs.
+    pub enabled: bool,
+    /// Required dip size, in percent. Fire when current price is at least
+    /// this many percent below the price at the start of the window.
+    pub dip_pct: f64,
+    /// Rolling-window length in seconds. The detector compares the current
+    /// price to the OLDEST tick still inside this window.
+    pub window_secs: u64,
+    /// Debounce in seconds after a fire — suppresses re-firing while a deep
+    /// dump persists. Independent of the post-sell `cooldown_secs` from
+    /// `[macd]`, which still applies after an exit.
+    pub debounce_secs: u64,
+}
+
+impl Default for CapitulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dip_pct: 50.0,
+            window_secs: 60,
+            debounce_secs: 60,
         }
     }
 }

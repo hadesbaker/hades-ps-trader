@@ -1,11 +1,10 @@
-//! Pre-buy rug detection.
+//! Rug detection.
 //!
 //! A [`RugGuard`] lives for one monitoring session. The price-poll loop feeds
 //! it every tick via [`RugGuard::observe`], so it accumulates the session's
-//! price and pool-liquidity peaks. Just before a bullish crossover would buy,
-//! the session calls [`RugGuard::check`]: it compares the *current* reading
-//! against those peaks and the configured floors, and returns a reason string
-//! when the token looks rugged — in which case the session skips that buy.
+//! price and pool-liquidity peaks. On every tick the session also calls
+//! [`RugGuard::is_rugged`] — if it returns `Some(reason)`, the session
+//! force-sells any open position and abandons the token.
 //!
 //! Limitation: the peaks only cover the window the bot has actually observed.
 //! If pool discovery was slow, the real post-graduation top can be missed, so
@@ -38,18 +37,12 @@ impl RugGuard {
         }
     }
 
-    /// Decide whether a buy should be blocked right now. `Some(reason)` means
-    /// the token looks rugged and the buy should be skipped; `None` means clear.
-    pub fn check(&self, f: &RugFilter, price_sol: f64, pool_sol: f64) -> Option<String> {
-        if !f.enabled {
+    /// Per-tick rug check. `Some(reason)` means the token looks rugged right
+    /// now and the session should abandon it; `None` means clear (or not
+    /// enough samples yet to judge — treated as clear so we keep observing).
+    pub fn is_rugged(&self, f: &RugFilter, price_sol: f64, pool_sol: f64) -> Option<String> {
+        if !f.enabled || self.samples < f.min_samples {
             return None;
-        }
-
-        if self.samples < f.min_samples {
-            return Some(format!(
-                "only {} price sample(s) so far (<{}) — not enough history to judge",
-                self.samples, f.min_samples
-            ));
         }
 
         // 1. Absolute liquidity floor — the most reliable rug signal.
@@ -84,4 +77,5 @@ impl RugGuard {
 
         None
     }
+
 }

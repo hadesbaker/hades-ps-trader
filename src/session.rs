@@ -1,15 +1,22 @@
-//! Per-graduation MACD trading session.
+//! Per-graduation trading session.
 //!
 //! Flow:
 //!   1. Run trading filters (if enabled) once at graduation. Reject → no session.
 //!   2. Spawn the price-poll task and start aggregating candles.
-//!   3. On each candle close, feed the close to MACD.
-//!        - Bullish crossover, no open position, rug guard clear, cooldown
-//!          elapsed, slot available → buy.
-//!        - Bearish crossover with an open position → sell.
-//!   4. When `max_monitor_time` elapses, stop accepting new signals and
+//!   3. On every price tick, run the rug guard. If it fires, force-sell any
+//!      open position and abandon the session.
+//!   4. If `[capitulation].enabled`, run the capitulation detector per tick;
+//!      a fired signal triggers a buy (subject to no-pyramiding, cooldown,
+//!      max_positions). MACD candle aggregation still runs for logging but
+//!      bullish crossovers no longer fire buys.
+//!   5. Otherwise, on each candle close, feed the close to MACD.
+//!        - Bullish crossover, no open position, cooldown elapsed, slot
+//!          available → buy.
+//!        - Bearish crossover → no action (exits are PnL-driven).
+//!   6. When `max_monitor_time` elapses, stop accepting new signals and
 //!      force-sell any open position before returning.
 
+use crate::capitulation::CapitulationDetector;
 use crate::config::Config;
 use crate::discord::Notifier;
 use crate::macd::{CandleAggregator, Crossover, Macd, MacdEvent};
@@ -131,6 +138,12 @@ async fn run_session(
     let mut last_price: Option<f64> = None;
     let mut tick: u64 = 0;
     let mut rug_guard = RugGuard::new();
+    let mut cap_detector = CapitulationDetector::new(&cfg.capitulation);
+    if cap_detector.enabled() {
+        info!(
+            "[{tag}] capitulation entry ENABLED — MACD bullish crossovers will not trigger buys"
+        );
+    }
 
     let deadline_fut = async {
         if let Some(d) = deadline {
@@ -158,6 +171,38 @@ async fn run_session(
                 last_price = Some(price);
                 tick += 1;
                 rug_guard.observe(price, pool_sol);
+
+                // Per-tick rug detection — abandon the session the moment
+                // pool liquidity drains or price collapses past the configured
+                // floors. Any open position is force-sold first; the loop then
+                // exits so the bot stops polling a dead token.
+                if let Some(reason) = rug_guard.is_rugged(&cfg.rug, price, pool_sol) {
+                    if let Some(pos) = position.take() {
+                        let pct = pos.pnl_pct(price);
+                        warn!(
+                            "[{tag}] RUG DETECTED — {reason}; force-selling open position at pnl={pct:+.2}%"
+                        );
+                        let sell_reason = format!("Rug detected: {reason}");
+                        match try_sell(
+                            &cfg, &http, &rpc, &keypair, &notifier,
+                            &pos, pct, &sell_reason, &tag, dry_run,
+                        ).await {
+                            Ok(()) => {
+                                open_positions.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[{tag}] RUG-TRIGGERED SELL FAILED: {e}; position still on-chain. \
+                                     Sell manually. mint={mint_str}"
+                                );
+                                open_positions.fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                    } else {
+                        info!("[{tag}] RUG DETECTED — {reason}; abandoning session");
+                    }
+                    break;
+                }
 
                 // PnL-based exit — evaluated on every price tick while a
                 // position is open: stop-loss, take-profit, dynamic trailing
@@ -203,6 +248,41 @@ async fn run_session(
                 debug!("[{tag}] tick price={:.10}", price);
 
                 let now = Instant::now();
+
+                // Capitulation dip-buy detector — alternative entry mode to
+                // MACD. Per-tick: observe, then check; on fire, run the same
+                // buy gating as the MACD bullish branch.
+                if cap_detector.enabled() {
+                    cap_detector.observe(now, price);
+                    if let Some(reason) = cap_detector.check(now, price) {
+                        if position.is_some() {
+                            debug!("[{tag}] capitulation skipped: already in position");
+                        } else if let Some(t) = last_sell_at {
+                            let since = now.duration_since(t);
+                            if since < cooldown {
+                                debug!(
+                                    "[{tag}] capitulation skipped: cooldown {}s remaining",
+                                    (cooldown - since).as_secs()
+                                );
+                            } else {
+                                info!("[{tag}] CAPITULATION SIGNAL: {reason}");
+                                position = try_buy(
+                                    &cfg, &http, &rpc, &keypair, &open_positions,
+                                    &notifier, &mint, &mint_str, name.as_deref(),
+                                    symbol.as_deref(), &tag, dry_run,
+                                ).await;
+                            }
+                        } else {
+                            info!("[{tag}] CAPITULATION SIGNAL: {reason}");
+                            position = try_buy(
+                                &cfg, &http, &rpc, &keypair, &open_positions,
+                                &notifier, &mint, &mint_str, name.as_deref(),
+                                symbol.as_deref(), &tag, dry_run,
+                            ).await;
+                        }
+                    }
+                }
+
                 let Some(close) = aggregator.on_tick(price, now) else {
                     continue;
                 };
@@ -223,12 +303,12 @@ async fn run_session(
                         );
                         match direction {
                             Crossover::Bullish => {
-                                if position.is_some() {
+                                if cap_detector.enabled() {
+                                    debug!(
+                                        "[{tag}] bullish ignored: capitulation entry mode is active"
+                                    );
+                                } else if position.is_some() {
                                     debug!("[{tag}] bullish ignored: already in position");
-                                } else if let Some(reason) =
-                                    rug_guard.check(&cfg.rug, price, pool_sol)
-                                {
-                                    info!("[{tag}] bullish skipped: RUG GUARD — {reason}");
                                 } else if let Some(t) = last_sell_at {
                                     let since = now.duration_since(t);
                                     if since < cooldown {

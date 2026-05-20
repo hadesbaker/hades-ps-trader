@@ -17,7 +17,8 @@ A Rust bot that listens for pump.fun → PumpSwap token graduations in real time
 - Concurrency cap (`max_positions`) on open positions across all monitored tokens
 - `max_monitor_time` per-token monitoring window; any open position is force-sold before the session ends
 - Optional one-shot on-chain trading filters at graduation (holders, bonding-curve activity, top-10 concentration)
-- Continuous pre-buy rug guard — blocks buys into drained-liquidity or already-dumped tokens
+- Continuous rug guard — abandons tokens (force-selling any open position) on drained liquidity or collapsed price
+- Optional capitulation dip-buy entry mode (alternative to MACD): per-tick rolling-window dip detector, picked via `[capitulation].enabled`
 - Buy + sell via PumpPortal `/api/trade-local` (locally signed, you keep custody)
 - `send_transaction_with_config` with RPC rebroadcast retries and explicit on-chain confirmation polling
 - Slippage escalation on tx failure (buy: up to +10%, sell: up to +95% to avoid bag-holding)
@@ -140,15 +141,26 @@ Run **once** at graduation, before monitoring starts. If a filter fails, the tok
 
 ### `[rug]`
 
-Pre-buy rug guard. Evaluated on every bullish crossover, just before a buy fires, against the price + pool-liquidity history gathered since the session started. A failing check skips that one buy; the session keeps monitoring, so a later signal can still buy if the token recovers. Independent of `[tradingfilters]` (which run once at graduation) — this runs continuously, per candidate buy. If the whole `[rug]` section is omitted, the defaults below apply.
+Continuous rug guard. Evaluated **on every price tick** against the price + pool-liquidity history gathered since the session started. When it fires, the session force-sells any open position (reason `"Rug detected"`) and abandons the token — no more RPC polls for it. Independent of `[tradingfilters]` (which run once at graduation) — this runs throughout the session. If the whole `[rug]` section is omitted, the defaults below apply.
 
 | Key                          | Example | Purpose                                                                                                                                                                         |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `rug.enabled`                | `true`  | Master switch. `false` never blocks a buy.                                                                                                                                      |
-| `rug.min_pool_sol`           | `5.0`   | Minimum WSOL liquidity (in SOL) the PumpSwap pool must hold to allow a buy. A pulled-liquidity rug drains this toward zero. Tune to healthy graduated-pool sizes. `0` disables. |
-| `rug.max_liquidity_drop_pct` | `50.0`  | Skip the buy if pool liquidity is down more than this % from its session peak (liquidity being removed). `0` disables.                                                          |
-| `rug.max_drawdown_pct`       | `70.0`  | Skip the buy if price is down more than this % from the session high (token already pumped and dumped). `0` disables.                                                           |
-| `rug.min_samples`            | `20`    | Minimum price samples gathered before the guard will clear any buy. Avoids judging a token on a near-empty history.                                                             |
+| `rug.min_pool_sol`           | `5.0`   | Minimum WSOL liquidity (in SOL) the PumpSwap pool must hold. A pulled-liquidity rug drains this toward zero. Below the floor → abandon the token. Tune to healthy graduated-pool sizes. `0` disables. |
+| `rug.max_liquidity_drop_pct` | `50.0`  | Abandon the token if pool liquidity is down more than this % from its session peak (liquidity being removed). `0` disables.                                                                            |
+| `rug.max_drawdown_pct`       | `70.0`  | Abandon the token if price is down more than this % from the session high (token already pumped and dumped). `0` disables.                                                                             |
+| `rug.min_samples`            | `20`    | Minimum price samples gathered before the guard will judge a token. Avoids false positives on a near-empty history.                                                                                    |
+
+### `[capitulation]`
+
+Optional alternative entry mode. When `enabled = true`, the bot fires a buy on every tick whose price is at least `dip_pct` below the price at the start of a `window_secs` rolling window. MACD candle aggregation and logging continue (useful for analysis), but bullish MACD crossovers no longer fire buys — capitulation **replaces** MACD as the entry trigger. After a fire the detector is debounced for `debounce_secs`; post-sell `cooldown_secs` from `[macd]` still applies. Defaults below came from the `analysis/capitulation.py` sweep on test5+test6: rolling-window pct change with `dip_pct=50, window_secs=60` was the most profitable point. If this whole section is omitted, defaults apply (the detector is **disabled**).
+
+| Key                          | Example | Purpose                                                                                                                                                                                |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `capitulation.enabled`       | `false` | Master switch. `false` (default) → MACD remains the entry trigger and this detector never runs.                                                                                        |
+| `capitulation.dip_pct`       | `50.0`  | Required dip size, in percent. Fire when current price is at least this many percent below the price at the start of the window.                                                       |
+| `capitulation.window_secs`   | `60`    | Rolling-window length. The detector compares current price to the OLDEST tick still inside this window.                                                                                |
+| `capitulation.debounce_secs` | `60`    | Debounce in seconds after a fire — suppresses re-firing while a deep dump persists. Independent of post-sell `cooldown_secs` from `[macd]`, which still applies after an exit.         |
 
 ## How it works
 
@@ -159,17 +171,35 @@ graduation event (PumpPortal subscribeMigration)
   -> spawn per-token session:
        price-poll task reads PumpSwap pool every price_poll_interval_ms
 
-       ENTRY — each tick feeds the candle aggregator (bar = candle_interval_secs);
-       on each candle close MACD updates its fast / slow / signal EMAs:
-         on bullish crossover:
-           - already in a trade on this token?  -> skip (no pyramiding)
-           - [rug] guard flags the token?       -> skip, keep watching
-           - inside cooldown_secs of last sell? -> skip
-           - max_positions full?                -> skip, keep watching
-           - else                               -> reserve slot, buy
-                                                   resolve fill via ATA (with by-mint scan fallback)
-                                                   Discord: BUY embed
-         on bearish crossover                   -> no action (exits are PnL-driven)
+       RUG GUARD — runs on every price tick after observing it. If pool
+       liquidity falls below the floor / drops too far from its session peak,
+       or price collapses too far from its session high:
+           - position open? -> force-sell at market (reason "Rug detected"),
+                               then abandon the session
+           - no position?  -> abandon the session immediately
+       Either way the token is dropped from monitoring — no more RPC polls.
+
+       ENTRY — one of two modes, picked by [capitulation].enabled:
+
+         MODE A (default): MACD bullish crossover
+           each tick feeds the candle aggregator (bar = candle_interval_secs);
+           on each candle close MACD updates its fast / slow / signal EMAs:
+             on bullish crossover:
+               - already in a trade on this token?  -> skip (no pyramiding)
+               - inside cooldown_secs of last sell? -> skip
+               - max_positions full?                -> skip, keep watching
+               - else                               -> reserve slot, buy
+                                                       resolve fill via ATA (with by-mint scan fallback)
+                                                       Discord: BUY embed
+             on bearish crossover                   -> no action (exits are PnL-driven)
+
+         MODE B ([capitulation].enabled = true): rolling-window dip
+           per-tick detector. If current price is at least dip_pct below the
+           OLDEST tick still inside a window_secs rolling window, fire a buy
+           (subject to the same no-pyramiding / cooldown / max_positions
+           gates as MACD). After firing, debounce for debounce_secs before
+           re-considering. MACD candle aggregation and logging continue but
+           bullish crossovers no longer trigger buys.
 
        EXIT — while a position is open, every price tick checks (first match wins):
          1. max_hold_time elapsed since the buy            -> sell

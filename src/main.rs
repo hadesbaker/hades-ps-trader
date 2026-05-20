@@ -1,3 +1,4 @@
+mod capitulation;
 mod config;
 mod discord;
 mod macd;
