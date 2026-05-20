@@ -6,7 +6,7 @@ wallet_path = "wallet.json"
 [trading]
 # Slippage tolerance (percentage) — starting value. Sells escalate from here
 # up to +95% in 5% steps to avoid bag-holding.
-max_slippage = 10.0
+slippage = 10.0
 # Lamports per buy. Each MACD bullish crossover spends this much.
 trade_amount = 250_000_000  # 0.25 SOL
 # Priority fee per tx (in SOL). Required by PumpPortal /api/trade-local.

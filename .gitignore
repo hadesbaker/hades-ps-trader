@@ -3,3 +3,5 @@
 config.toml
 wallet.json
 /logs/
+.claude/settings.local.json
+/analysis/

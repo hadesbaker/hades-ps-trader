@@ -335,7 +335,7 @@ async fn try_buy(
             mint: mint_str,
             symbol,
             amount_sol,
-            slippage_pct: cfg.trading.max_slippage,
+            slippage_pct: cfg.trading.slippage,
             priority_fee_sol: cfg.trading.priority_fee_sol,
             max_retries: cfg.trading.buy_tx_retries,
         },
@@ -438,7 +438,7 @@ async fn try_sell(
         SellAllParams {
             mint: &pos.mint,
             symbol: pos.symbol.as_deref(),
-            slippage_pct: cfg.trading.max_slippage,
+            slippage_pct: cfg.trading.slippage,
             priority_fee_sol: cfg.trading.priority_fee_sol,
             max_retries: cfg.trading.sell_tx_retries,
         },

@@ -17,7 +17,7 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Trading {
-    pub max_slippage: f64,
+    pub slippage: f64,
     pub trade_amount: u64,
     pub priority_fee_sol: f64,
     /// Take-profit: exit once PnL reaches this percent. 0 disables.
