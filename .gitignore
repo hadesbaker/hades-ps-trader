@@ -5,3 +5,5 @@ wallet.json
 /logs/
 .claude/settings.local.json
 /analysis/
+entry_rows.json
+sweep_results.json
