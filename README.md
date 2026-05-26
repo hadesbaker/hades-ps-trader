@@ -153,14 +153,23 @@ Continuous rug guard. Evaluated **on every price tick** against the price + pool
 
 ### `[capitulation]`
 
-Optional alternative entry mode. When `enabled = true`, the bot fires a buy on every tick whose price is at least `dip_pct` below the price at the start of a `window_secs` rolling window. MACD candle aggregation and logging continue (useful for analysis), but bullish MACD crossovers no longer fire buys — capitulation **replaces** MACD as the entry trigger. After a fire the detector is debounced for `debounce_secs`; post-sell `cooldown_secs` from `[macd]` still applies. Defaults below came from the `analysis/capitulation.py` sweep on test5+test6: rolling-window pct change with `dip_pct=50, window_secs=60` was the most profitable point. If this whole section is omitted, defaults apply (the detector is **disabled**).
+Optional alternative entry mode. When `enabled = true`, MACD bullish crossovers no longer fire buys — capitulation **replaces** MACD as the entry trigger. (MACD candle aggregation and logging continue, but only for analysis.) The detector is a **two-stage state machine**: it watches for a sustained dump, then waits for a confirmed bounce off the local low before firing. If this whole section is omitted, defaults apply (the detector is **disabled**).
 
-| Key                          | Example | Purpose                                                                                                                                                                                |
-| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `capitulation.enabled`       | `false` | Master switch. `false` (default) → MACD remains the entry trigger and this detector never runs.                                                                                        |
-| `capitulation.dip_pct`       | `50.0`  | Required dip size, in percent. Fire when current price is at least this many percent below the price at the start of the window.                                                       |
-| `capitulation.window_secs`   | `60`    | Rolling-window length. The detector compares current price to the OLDEST tick still inside this window.                                                                                |
-| `capitulation.debounce_secs` | `60`    | Debounce in seconds after a fire — suppresses re-firing while a deep dump persists. Independent of post-sell `cooldown_secs` from `[macd]`, which still applies after an exit.         |
+**STAGE 1 — detect dump:** When current price is at least `dip_pct` below the price at the start of a `window_secs` rolling window, record the local low (`pending_low`). Continue tracking the lowest price during the dump. Does NOT fire.
+
+**STAGE 2 — wait for confirmed reclaim:** When price reclaims at least `reclaim_pct` above `pending_low` AND sustains that reclaim for `reclaim_confirm_secs` continuously → fire a buy. Falling back below the reclaim threshold resets the confirmation timer. If no confirmed reclaim within `pending_expire_secs` of the dump → abandon the pending state and reset.
+
+After a fire the detector is debounced for `debounce_secs` (post-sell `cooldown_secs` from `[macd]` still applies as a separate gate). Defaults for `dip_pct=50, window_secs=60` came from the `analysis/capitulation.py` sweep on test5+test6; STAGE-2 defaults (`reclaim_pct=10`, `reclaim_confirm_secs=10`, `pending_expire_secs=30`) are placeholders pending a sweep for the reclaim variant.
+
+| Key                                  | Example | Purpose                                                                                                                                                                                |
+| ------------------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `capitulation.enabled`               | `false` | Master switch. `false` (default) → MACD remains the entry trigger and this detector never runs.                                                                                        |
+| `capitulation.dip_pct`               | `50.0`  | STAGE 1. Required dip size, in percent. Pending state begins when current price is at least this many percent below the price at the start of the window.                              |
+| `capitulation.window_secs`           | `60`    | STAGE 1. Rolling-window length. The detector compares current price to the OLDEST tick still inside this window.                                                                       |
+| `capitulation.reclaim_pct`           | `10.0`  | STAGE 2. Required reclaim off the local low, in percent. Larger waits for stronger bounces but misses fast V-recoveries; smaller catches weaker bounces with more false starts.        |
+| `capitulation.reclaim_confirm_secs`  | `10`    | STAGE 2. How many seconds the reclaim threshold must be continuously sustained before firing. Filters spike-and-fade fake bounces. `0` fires on the first reclaim tick.                |
+| `capitulation.pending_expire_secs`   | `30`    | How long to keep watching for a reclaim after STAGE 1 trips. If no confirmed reclaim within this window, the pending dump is abandoned and the detector resets.                        |
+| `capitulation.debounce_secs`         | `60`    | Post-fire debounce — suppresses re-firing on the same session. Independent of post-sell `cooldown_secs` from `[macd]`, which still applies after an exit.                              |
 
 ## How it works
 
@@ -193,13 +202,21 @@ graduation event (PumpPortal subscribeMigration)
                                                        Discord: BUY embed
              on bearish crossover                   -> no action (exits are PnL-driven)
 
-         MODE B ([capitulation].enabled = true): rolling-window dip
-           per-tick detector. If current price is at least dip_pct below the
-           OLDEST tick still inside a window_secs rolling window, fire a buy
-           (subject to the same no-pyramiding / cooldown / max_positions
-           gates as MACD). After firing, debounce for debounce_secs before
-           re-considering. MACD candle aggregation and logging continue but
-           bullish crossovers no longer trigger buys.
+         MODE B ([capitulation].enabled = true): dip-and-reclaim (two stage)
+           STAGE 1: per-tick, if current price is at least dip_pct below the
+             OLDEST tick still inside a window_secs rolling window, record
+             the local low (pending_low). Do NOT fire. Track the lowest
+             price while the dump deepens. If pending_expire_secs elapses
+             without a confirmed reclaim, abandon the pending state.
+           STAGE 2: once pending, watch for price to bounce reclaim_pct
+             above pending_low AND sustain that bounce for
+             reclaim_confirm_secs continuously. Falling back below the
+             reclaim threshold resets the confirmation timer. On confirm,
+             fire a buy (subject to the same no-pyramiding / cooldown /
+             max_positions gates as MACD). After firing, debounce for
+             debounce_secs.
+           MACD candle aggregation and logging continue but bullish
+           crossovers no longer trigger buys.
 
        EXIT — while a position is open, every price tick checks (first match wins):
          1. max_hold_time elapsed since the buy            -> sell

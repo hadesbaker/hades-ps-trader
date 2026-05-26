@@ -111,31 +111,52 @@ impl Default for RugFilter {
     }
 }
 
-/// Capitulation dip-buy entry. Alternative to MACD: when `enabled = true`,
-/// the bot fires a buy on every tick whose price is `>= dip_pct` below the
-/// price at the start of a `window_secs` rolling window — and MACD bullish
-/// crossovers stop triggering buys (MACD candle aggregation and logging
-/// continue, but only for analysis). After firing the detector is debounced
-/// for `debounce_secs` to avoid stacking entries during a deep dump.
+/// Capitulation dip-and-reclaim entry. Alternative to MACD: when
+/// `enabled = true`, the bot watches for a sustained dump (price down at
+/// least `dip_pct` over `window_secs`) and then waits for a confirmed bounce
+/// off the low before buying. The fire condition is two-stage:
 ///
-/// Defaults come from the `analysis/capitulation.py` sweep on test5+test6:
-/// rolling-window pct change with `dip_pct=50, window_secs=60` was the most
-/// profitable point.
+///   STAGE 1 — dump detected (price ≤ -dip_pct over window). Record the
+///             local low; do NOT buy.
+///   STAGE 2 — price reclaims at least `reclaim_pct` above the local low AND
+///             sustains that reclaim for `reclaim_confirm_secs` seconds. If
+///             no reclaim happens within `pending_expire_secs` of the dump,
+///             abandon this dump and start over.
+///
+/// Buying the bounce (not the dip) targets the test9 finding that mid-dump
+/// fills cost ~9pp of edge — liquidity flees during the dump and returns on
+/// the bounce. After firing the detector is debounced for `debounce_secs` to
+/// avoid restacking entries.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CapitulationConfig {
     /// Master switch. `false` (default) → MACD is the entry trigger and this
     /// detector never runs.
     pub enabled: bool,
-    /// Required dip size, in percent. Fire when current price is at least
-    /// this many percent below the price at the start of the window.
+    /// Required dip size, in percent. STAGE 1 trips when current price is at
+    /// least this many percent below the price at the start of the window.
     pub dip_pct: f64,
     /// Rolling-window length in seconds. The detector compares the current
     /// price to the OLDEST tick still inside this window.
     pub window_secs: u64,
-    /// Debounce in seconds after a fire — suppresses re-firing while a deep
-    /// dump persists. Independent of the post-sell `cooldown_secs` from
-    /// `[macd]`, which still applies after an exit.
+    /// Required reclaim off the local low, in percent. STAGE 2 fires when
+    /// current price has bounced at least this much above `pending_low` AND
+    /// sustains it for `reclaim_confirm_secs`. Smaller = catches weaker
+    /// bounces but more false starts; larger = waits for stronger bounces
+    /// but misses fast V-recoveries.
+    pub reclaim_pct: f64,
+    /// How long (seconds) to keep watching for a reclaim after STAGE 1
+    /// trips. If no reclaim within this window, the pending dump is
+    /// abandoned and the detector resets. Tunes patience: too short misses
+    /// slow bounces; too long means we keep watching dead tokens.
+    pub pending_expire_secs: u64,
+    /// How long (seconds) the reclaim threshold must be continuously
+    /// sustained before STAGE 2 fires. Filters spike-and-fade fake bounces.
+    /// 0 disables sustain (fires on first reclaim tick).
+    pub reclaim_confirm_secs: u64,
+    /// Debounce in seconds after a fire — suppresses re-firing on the same
+    /// session. Independent of the post-sell `cooldown_secs` from `[macd]`,
+    /// which still applies after an exit.
     pub debounce_secs: u64,
 }
 
@@ -145,6 +166,9 @@ impl Default for CapitulationConfig {
             enabled: false,
             dip_pct: 50.0,
             window_secs: 60,
+            reclaim_pct: 10.0,
+            pending_expire_secs: 30,
+            reclaim_confirm_secs: 10,
             debounce_secs: 60,
         }
     }

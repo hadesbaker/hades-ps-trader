@@ -109,36 +109,50 @@ max_drawdown_pct = 70.0
 # price_poll_interval_ms=500 a sample is ~0.5s, so 20 ≈ 10s of history.
 min_samples = 20
 
-# Capitulation Dip-Buy Entry (alternative to MACD)
-# When enabled=true, the bot fires a buy on every tick whose price is at least
-# dip_pct below the price at the start of a window_secs rolling window. MACD
-# candle aggregation and logging continue (useful for analysis), but bullish
-# MACD crossovers no longer trigger buys — capitulation REPLACES MACD as the
-# entry trigger. After a fire, the detector is debounced for debounce_secs
-# before it can fire again on the same session. Post-sell cooldown_secs from
-# [macd] still applies.
+# Capitulation Dip-and-Reclaim Entry (alternative to MACD)
+# Two-stage entry trigger. When enabled=true, MACD bullish crossovers no
+# longer trigger buys (MACD candle aggregation and logging continue, but
+# only for analysis). Capitulation REPLACES MACD as the entry trigger.
 #
-# Defaults below came from the analysis/capitulation.py sweep on test5+test6:
-# rolling-window pct change with dip_pct=50, window_secs=60 was the most
-# profitable point under the live exit config.
+#   STAGE 1: detect dump — price down dip_pct over window_secs → record the
+#            local low, do NOT buy yet. Continue tracking the lowest price
+#            during the dump.
+#   STAGE 2: wait for bounce — price reclaims reclaim_pct above the local
+#            low AND sustains it for reclaim_confirm_secs seconds → fire a
+#            buy.
+# If no confirmed reclaim within pending_expire_secs of the dump → abandon
+# the pending state and reset. After firing, debounced for debounce_secs.
+# Post-sell cooldown_secs from [macd] still applies after an exit.
 #
-# Empirical notes from that backtest:
-#   - +60s forward-return median +3.25% (MACD: -1.1%) — real edge at short horizon
-#   - bounce decays past 120s; exit params currently tuned for MACD's slow
-#     crawl may give back the edge — consider tightening trail tiers + shorter
-#     max_hold when you flip this on
-#   - cost-sensitive: break-even at 5.19pt/round-trip, positive at <=4pt
+# Why bounce-buy (vs the earlier dip-only variant): test9 measured ~9pp of
+# signal-tick edge lost to execution because dip-only buys land mid-dump
+# while liquidity is fleeing. Buying the reclaim targets the moment
+# liquidity returns. Defaults below are placeholders; reclaim_pct and the
+# stage-2 timing knobs need a sweep against live data.
 [capitulation]
 # Master switch. false = MACD remains the entry trigger; this detector never
 # runs.
 enabled = false
-# Required dip size in percent. Fire when current price is at least this many
-# percent below the price at the start of the window.
+# STAGE 1 — Required dip size in percent. Sets the bar for what counts as a
+# capitulation event. Defaults from analysis/capitulation.py sweep.
 dip_pct = 50.0
-# Rolling-window length in seconds. The detector compares current price to the
-# OLDEST tick still inside this window.
+# STAGE 1 — Rolling-window length in seconds for the dump detection. The
+# detector compares current price to the OLDEST tick still inside this window.
 window_secs = 60
-# Debounce in seconds after a fire — suppresses re-firing while a deep dump
-# persists. Independent of the post-sell cooldown_secs from [macd], which
-# still applies after an exit.
+# STAGE 2 — Required reclaim off the local low, in percent. Larger waits for
+# stronger bounces but misses fast V-recoveries; smaller catches weaker
+# bounces but more false starts.
+reclaim_pct = 10.0
+# STAGE 2 — How long (seconds) the reclaim threshold must be continuously
+# sustained before firing. Falling back below the threshold resets the
+# confirmation timer. Filters spike-and-fade fake bounces. 0 = fire on first
+# reclaim tick.
+reclaim_confirm_secs = 10
+# How long (seconds) to keep watching for a reclaim after STAGE 1 trips. If
+# no confirmed reclaim within this window, the pending dump is abandoned and
+# the detector resets — useful so we don't keep watching dead tokens.
+pending_expire_secs = 30
+# Post-fire debounce in seconds — suppresses re-firing on the same session.
+# Independent of the post-sell cooldown_secs from [macd], which still applies
+# after an exit.
 debounce_secs = 60
