@@ -124,11 +124,12 @@ async fn run_session(
         n => Some(session_start + Duration::from_secs(n)),
     };
     let poll_interval = Duration::from_millis(cfg.trading.price_poll_interval_ms);
+    let read_timeout = Duration::from_millis(cfg.trading.pumpswap_read_timeout_ms);
     let candle_interval = Duration::from_secs(cfg.macd.candle_interval_secs);
     let cooldown = Duration::from_secs(cfg.macd.cooldown_secs);
     let pnl_log_every = cfg.trading.pnl_log_every_n_ticks;
 
-    let mut rx = price_feed::spawn_price_poll(rpc.clone(), mint_str.clone(), poll_interval);
+    let mut rx = price_feed::spawn_price_poll(rpc.clone(), mint_str.clone(), poll_interval, read_timeout);
     let mut aggregator = CandleAggregator::new(candle_interval);
     let mut macd = Macd::new(cfg.macd.fast, cfg.macd.slow, cfg.macd.signal);
     let tiers = position::parse_tiers(&cfg.trading.dynamic_trailing_stop_thresholds);

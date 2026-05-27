@@ -35,6 +35,14 @@ pub struct Trading {
     pub sell_tx_retries: u64,
     /// How often the price feed reads the PumpSwap pool.
     pub price_poll_interval_ms: u64,
+    /// Per-call deadline for one PumpSwap vault read (`getMultipleAccounts`).
+    /// If the RPC doesn't respond within this many ms, the call is killed and
+    /// counted as a failure. Distinct from `price_poll_interval_ms`, which is
+    /// the pause BETWEEN polls; this is the budget for a SINGLE poll. On
+    /// Solana mainnet `getMultipleAccounts` can take 200-1500ms under load —
+    /// 1500-2000ms is a safe ceiling, anything tighter risks self-induced
+    /// failure storms when many sessions poll concurrently.
+    pub pumpswap_read_timeout_ms: u64,
     /// Emit a `PNL MONITOR` info line every Nth successful price tick. 0 disables.
     pub pnl_log_every_n_ticks: u64,
     /// Total seconds to monitor a single token after graduation. Any open

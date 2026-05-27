@@ -18,12 +18,15 @@ pub struct PriceUpdate {
 }
 
 /// Spawn a background task that discovers the mint's PumpSwap pool, then
-/// polls vault balances at `interval` and pushes `PriceUpdate`s. The task
-/// ends when the receiver is dropped.
+/// polls vault balances at `interval` and pushes `PriceUpdate`s. `read_timeout`
+/// is the per-call deadline on each `getMultipleAccounts` — calls slower than
+/// this are killed and counted as failures. The task ends when the receiver
+/// is dropped.
 pub fn spawn_price_poll(
     rpc: Arc<RpcClient>,
     mint: String,
     interval: Duration,
+    read_timeout: Duration,
 ) -> mpsc::UnboundedReceiver<PriceUpdate> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -49,7 +52,7 @@ pub fn spawn_price_poll(
 
         let mut consecutive_failures: u32 = 0;
         loop {
-            match pumpswap::fetch_pool_state(&rpc, &pool).await {
+            match pumpswap::fetch_pool_state(&rpc, &pool, read_timeout).await {
                 Ok(state) => {
                     if consecutive_failures >= 5 {
                         info!(

@@ -133,14 +133,19 @@ pub struct PoolState {
 }
 
 /// Read a PumpSwap pool's price and quote-side liquidity. One
-/// `getMultipleAccounts` call covers both vaults.
-pub async fn fetch_pool_state(rpc: &RpcClient, pool: &PoolInfo) -> Result<PoolState, BoxError> {
+/// `getMultipleAccounts` call covers both vaults. `timeout` caps how long we
+/// wait for the RPC response before treating the call as a failure.
+pub async fn fetch_pool_state(
+    rpc: &RpcClient,
+    pool: &PoolInfo,
+    timeout: Duration,
+) -> Result<PoolState, BoxError> {
     let accounts = tokio::time::timeout(
-        Duration::from_millis(500),
+        timeout,
         rpc.get_multiple_accounts(&[pool.base_vault, pool.quote_vault]),
     )
     .await
-    .map_err(|_| "PumpSwap vault read timed out (500ms)")??;
+    .map_err(|_| format!("PumpSwap vault read timed out ({}ms)", timeout.as_millis()))??;
 
     let base = accounts[0]
         .as_ref()
