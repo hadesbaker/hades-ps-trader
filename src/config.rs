@@ -18,6 +18,16 @@ pub struct Config {
     /// remains the entry trigger).
     #[serde(default)]
     pub capitulation: CapitulationConfig,
+    /// Optional dip-buy entry mode (derived from monitored-wallet analysis).
+    /// When `enabled = true`, takes precedence over BOTH MACD and capitulation
+    /// — they will not fire buys while dip_buy is active.
+    #[serde(default)]
+    pub dip_buy: DipBuyConfig,
+    /// Per-strategy exit profile applied only to dip_buy positions. MACD and
+    /// capitulation positions continue to use the universal `[trading]` exit
+    /// fields. Defaults match the empirically-derived strategy spec.
+    #[serde(default)]
+    pub dip_buy_exit: DipBuyExitConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -178,6 +188,78 @@ impl Default for CapitulationConfig {
             pending_expire_secs: 30,
             reclaim_confirm_secs: 10,
             debounce_secs: 60,
+        }
+    }
+}
+
+/// Dip-buy entry trigger derived from hades-wallet-monitor analysis.
+/// Fires when a mature PumpSwap pool experiences a real drawdown (price +
+/// TVL together) and the current price sits near the local low of the
+/// rolling window. Validated against 142 reconstructions; the criteria
+/// matched 35% of winners and 0% of losers after tightening
+/// `min_pool_sol_drawdown_pct` from 0.15 → 0.20.
+///
+/// Takes precedence over MACD and capitulation when `enabled = true`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DipBuyConfig {
+    pub enabled: bool,
+    /// Rolling window length for drawdown / quantile / TVL-drain calc.
+    pub window_secs: u64,
+    /// Required price drawdown from window max to current price.
+    pub min_drawdown_pct: f64,
+    /// Current price must be at or below this quantile of [min, max] in window.
+    pub max_entry_quantile: f64,
+    /// Required TVL drain from window max — confirms real sells.
+    pub min_pool_sol_drawdown_pct: f64,
+    /// Pool size floor at entry — avoid micro-pools.
+    pub min_pool_sol: f64,
+    /// Post-fire cooldown per session.
+    pub cooldown_secs: u64,
+    /// Rolling 24h cap on cumulative dip_buy spending. Bug-protection,
+    /// independent of strategy risk.
+    pub daily_spend_cap_sol: f64,
+}
+
+impl Default for DipBuyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_secs: 60,
+            min_drawdown_pct: 0.30,
+            max_entry_quantile: 0.30,
+            min_pool_sol_drawdown_pct: 0.20,
+            min_pool_sol: 30.0,
+            cooldown_secs: 60,
+            daily_spend_cap_sol: 2.0,
+        }
+    }
+}
+
+/// Exit profile applied ONLY to dip_buy positions. Empirical hold for the
+/// reconstructed winners was ~195s median; the time-stop here is at 600s
+/// (10 min) which would have killed the single matching loser in the
+/// validation set (which held 1283s and ended -27%).
+///
+/// The trader currently does full-exit-only (no partial sells), so the
+/// original spec's "scale 50% at +50%, rest at +100%" ladder is folded
+/// into a single take-profit at +75%. This captures most of the winner
+/// distribution without leaving big tails on the table; revisit if/when
+/// partial sells are added.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DipBuyExitConfig {
+    pub take_profit_pct: f64,
+    pub stop_loss_pct: f64,
+    pub max_hold_secs: u64,
+}
+
+impl Default for DipBuyExitConfig {
+    fn default() -> Self {
+        Self {
+            take_profit_pct: 75.0,
+            stop_loss_pct: 25.0,
+            max_hold_secs: 600,
         }
     }
 }

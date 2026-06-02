@@ -1,5 +1,6 @@
 mod capitulation;
 mod config;
+mod dip_buy;
 mod discord;
 mod macd;
 mod onchain;
@@ -13,6 +14,7 @@ mod trader;
 mod wallet;
 
 use crate::config::{BoxError, Config};
+use crate::dip_buy::{DailySpendTracker, SharedSpendTracker};
 use crate::discord::Notifier;
 use clap::Parser;
 use log::{error, info, warn};
@@ -119,6 +121,18 @@ async fn main() -> Result<(), BoxError> {
 
     let open_positions = Arc::new(AtomicUsize::new(0));
 
+    // Shared rolling-24h cap on dip_buy spending. Bug protection — refuses
+    // new dip_buy fires when cumulative spend over 24h would breach the cap.
+    let spend_tracker: SharedSpendTracker = Arc::new(std::sync::Mutex::new(
+        DailySpendTracker::new(cfg.dip_buy.daily_spend_cap_sol),
+    ));
+    if cfg.dip_buy.enabled {
+        info!(
+            "dip_buy ENABLED — MACD + capitulation buys suppressed; 24h spend cap = {:.2} SOL",
+            cfg.dip_buy.daily_spend_cap_sol
+        );
+    }
+
     info!("hades-ps-trader running. Waiting for graduations…");
 
     while let Some(ev) = migrations.recv().await {
@@ -128,6 +142,7 @@ async fn main() -> Result<(), BoxError> {
         let kp2 = keypair.clone();
         let positions2 = open_positions.clone();
         let notifier2 = notifier.clone();
+        let spend2 = spend_tracker.clone();
         let dry = args.dry_run;
         tokio::spawn(async move {
             // Migration frames don't include name/symbol, so look them up via
@@ -148,7 +163,7 @@ async fn main() -> Result<(), BoxError> {
                 Some(s) => info!("\x1b[1;4;95mgraduation -> {} ({s})\x1b[0m", ev.mint),
                 None => info!("\x1b[1;4;95mgraduation -> {}\x1b[0m", ev.mint),
             }
-            session::handle(cfg2, http2, rpc2, kp2, positions2, notifier2, ev, dry).await;
+            session::handle(cfg2, http2, rpc2, kp2, positions2, notifier2, spend2, ev, dry).await;
         });
     }
 

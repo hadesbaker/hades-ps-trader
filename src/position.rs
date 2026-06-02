@@ -1,8 +1,16 @@
-use crate::config::Trading;
+use crate::config::{DipBuyExitConfig, Trading};
 use std::time::Instant;
 
-/// Record of an open MACD-triggered trade. The trading loop holds at most one
-/// of these per monitored token at any time (no pyramiding).
+/// Which entry trigger created a position. Drives per-strategy exit logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryTrigger {
+    Macd,
+    Capitulation,
+    DipBuy,
+}
+
+/// Record of an open trade. The trading loop holds at most one per monitored
+/// token at any time (no pyramiding).
 #[derive(Debug)]
 pub struct Position {
     pub mint: String,
@@ -17,6 +25,8 @@ pub struct Position {
     /// Monotonic timestamp captured the moment the buy tx confirmed on-chain.
     /// Used to enforce `max_hold_time`.
     pub bought_at: Instant,
+    /// Which trigger fired the buy. Routes exit logic to the right config.
+    pub entry_trigger: EntryTrigger,
 }
 
 impl Position {
@@ -79,6 +89,41 @@ impl ExitReason {
 }
 
 pub fn decide_exit(
+    pos: &Position,
+    current_pct: f64,
+    elapsed_secs: u64,
+    cfg: &Trading,
+    dip_buy_exit: &DipBuyExitConfig,
+    tiers: &[TrailTier],
+) -> Option<ExitReason> {
+    match pos.entry_trigger {
+        EntryTrigger::DipBuy => decide_exit_dip_buy(current_pct, elapsed_secs, dip_buy_exit),
+        EntryTrigger::Macd | EntryTrigger::Capitulation => {
+            decide_exit_universal(pos, current_pct, elapsed_secs, cfg, tiers)
+        }
+    }
+}
+
+fn decide_exit_dip_buy(
+    current_pct: f64,
+    elapsed_secs: u64,
+    cfg: &DipBuyExitConfig,
+) -> Option<ExitReason> {
+    // Time-stop first — empirically the matching loser in validation held
+    // 1283s; this cap would have killed it well before -27%.
+    if cfg.max_hold_secs > 0 && elapsed_secs >= cfg.max_hold_secs {
+        return Some(ExitReason::MaxHoldTime { elapsed_secs, current_pct });
+    }
+    if cfg.stop_loss_pct > 0.0 && current_pct <= -cfg.stop_loss_pct {
+        return Some(ExitReason::StopLoss { pct: current_pct });
+    }
+    if cfg.take_profit_pct > 0.0 && current_pct >= cfg.take_profit_pct {
+        return Some(ExitReason::TakeProfit { pct: current_pct });
+    }
+    None
+}
+
+fn decide_exit_universal(
     pos: &Position,
     current_pct: f64,
     elapsed_secs: u64,

@@ -1,0 +1,105 @@
+# Wallet Configuration
+wallet_path = "wallet.json"
+# Generate a new wallet with: solana-keygen new --outfile wallet.json
+
+# Trading Configuration
+[trading]
+# Slippage tolerance (percentage)
+slippage = 15.0 # 15%
+# Lamports per buy
+trade_amount = 500_000_000  # 0.5 SOL
+# Priority fee per tx (SOL)
+priority_fee_sol = 0.001
+# Take-profit: exit once PnL reaches this percent. 0 disables it.
+profit_target_percent = 0
+# Hard stop-loss: exit once PnL falls to this percent loss. 0 disables it.
+stop_loss_percent = 15.0 # 15%
+# Maximum number of concurrent OPEN positions, across all monitored tokens
+max_positions = 3
+# RPC-side rebroadcast retries for buy / sell tx
+buy_tx_retries = 5
+sell_tx_retries = 5
+# How often the price feed reads the PumpSwap pool
+price_poll_interval_ms = 500
+# Per-call deadline for a single PumpSwap vault read (getMultipleAccounts).
+pumpswap_read_timeout_ms = 1000
+# Emit a `PNL MONITOR` line every N successful price ticks. 0 disables it
+pnl_log_every_n_ticks = 5
+# Total seconds to monitor a single token after graduation.
+# Set 0 to monitor indefinitely (until process exit).
+max_monitor_time = 5400 # 1.5 hour
+# Maximum seconds to hold a single open position before exiting it. 0 disables it
+max_hold_time = 900 # 15 minutes
+# Dynamic trailing stop: "gain%:trail%" pairs, comma-separated.
+# When peak PnL crosses a gain tier, exit if it drops trail% from peak.
+dynamic_trailing_stop_thresholds = "15:6,20:8,30:10,40:15,55:20,75:22,100:25,130:30"
+
+# MACD Configuration
+[macd]
+# Candle (bar) timeframe in seconds. MACD runs on candle closes.
+candle_interval_secs = 60 # 60s candles
+# EMA periods (classic 12/26/9)
+fast = 12
+slow = 26
+signal = 7
+# Minimum seconds between a sell and the next buy on the same token.
+# Filters out whipsaw re-entries. Set 0 to disable.
+cooldown_secs = 30
+
+# Trading Filters
+# Run once at graduation, before monitoring starts
+# Set any individual value to 0 to disable just that check
+[tradingfilters]
+enabled = false
+min_holders = 100
+min_txs = 250
+# Combined top-10 holder concentration cap (fraction in [0, 1])
+top_ten_holder_percentage = 0.3 # 30%
+
+# Rug Detection
+# Runs on EVERY price tick. When it fires, the session force-sells any open
+# position (reason "Rug detected") and abandons the token entirely — no more
+# RPC polls. Independent of [tradingfilters] (which run once at graduation).
+[rug]
+# Master switch. false = never abandon a token.
+enabled = true
+# Minimum WSOL liquidity (in SOL) the PumpSwap pool must hold. 0 disables.
+min_pool_sol = 5.0
+# Abandon if pool liquidity is down more than this % from session peak. 0 disables.
+max_liquidity_drop_pct = 50.0
+# Abandon if price is down more than this % from session high. 0 disables.
+max_drawdown_pct = 70.0
+# Minimum price samples gathered before the guard will judge a token.
+min_samples = 20
+
+# Capitulation Dip-and-Reclaim Entry (alternative to MACD)
+# When enabled=true, REPLACES MACD as the entry trigger. Two-stage state machine:
+#   STAGE 1: detect dump — price down dip_pct over window_secs → record local low,
+#            do NOT buy. Continue tracking lowest price during the dump.
+#   STAGE 2: wait for bounce — price reclaims reclaim_pct above the local low AND
+#            sustains it for reclaim_confirm_secs → fire buy.
+# If no reclaim within pending_expire_secs of the dump → abandon and reset.
+# After a fire, debounced for debounce_secs.
+#
+# Why bounce-buy: test9 (dip-only) showed mid-dump fills cost ~9pp of edge
+# because liquidity flees during the dump and returns on the bounce. Buying
+# the reclaim targets the moment liquidity comes back.
+[capitulation]
+# Master switch. false = MACD remains the entry trigger.
+enabled = true
+# STAGE 1 — Required dip size in percent (current vs oldest tick in window).
+dip_pct = 50.0
+# STAGE 1 — Rolling-window length in seconds for the dump detection.
+window_secs = 60
+# STAGE 2 — Required reclaim off the local low, in percent. Larger = waits
+# for stronger bounces but misses fast V-recoveries.
+reclaim_pct = 12.0 # 12%
+# STAGE 2 — How long the reclaim threshold must be continuously sustained
+# before firing. Filters spike-and-fade fake bounces. 0 = fire on first
+# reclaim tick.
+reclaim_confirm_secs = 20 # 20s
+# How long to keep watching for a reclaim after STAGE 1 trips. If no
+# confirmed reclaim within this window, the pending dump is abandoned.
+pending_expire_secs = 30
+# Post-fire debounce seconds — separate from [macd].cooldown_secs.
+debounce_secs = 60

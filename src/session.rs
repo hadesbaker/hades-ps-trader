@@ -18,11 +18,12 @@
 
 use crate::capitulation::CapitulationDetector;
 use crate::config::Config;
+use crate::dip_buy::{DipBuyDetector, SharedSpendTracker};
 use crate::discord::Notifier;
 use crate::macd::{CandleAggregator, Crossover, Macd, MacdEvent};
 
 use crate::onchain;
-use crate::position::{self, Position};
+use crate::position::{self, EntryTrigger, Position};
 use crate::price_feed;
 use crate::pumpportal::MigrationEvent;
 use crate::rug::RugGuard;
@@ -47,6 +48,7 @@ pub async fn handle(
     keypair: Arc<Keypair>,
     open_positions: Arc<AtomicUsize>,
     notifier: Notifier,
+    spend_tracker: SharedSpendTracker,
     event: MigrationEvent,
     dry_run: bool,
 ) {
@@ -93,6 +95,7 @@ pub async fn handle(
         keypair,
         open_positions,
         notifier,
+        spend_tracker,
         mint,
         mint_str,
         name,
@@ -111,6 +114,7 @@ async fn run_session(
     keypair: Arc<Keypair>,
     open_positions: Arc<AtomicUsize>,
     notifier: Notifier,
+    spend_tracker: SharedSpendTracker,
     mint: Pubkey,
     mint_str: String,
     name: Option<String>,
@@ -140,7 +144,12 @@ async fn run_session(
     let mut tick: u64 = 0;
     let mut rug_guard = RugGuard::new();
     let mut cap_detector = CapitulationDetector::new(&cfg.capitulation);
-    if cap_detector.enabled() {
+    let mut dip_buy_detector = DipBuyDetector::new(&cfg.dip_buy);
+    if dip_buy_detector.enabled() {
+        info!(
+            "[{tag}] dip_buy entry ENABLED — MACD + capitulation will not trigger buys"
+        );
+    } else if cap_detector.enabled() {
         info!(
             "[{tag}] capitulation entry ENABLED — MACD bullish crossovers will not trigger buys"
         );
@@ -218,8 +227,10 @@ async fn run_session(
                         );
                     }
                     let elapsed_secs = pos.bought_at.elapsed().as_secs();
-                    position::decide_exit(pos, pct, elapsed_secs, &cfg.trading, &tiers)
-                        .map(|reason| (reason, pct, pos.peak_pct))
+                    position::decide_exit(
+                        pos, pct, elapsed_secs, &cfg.trading, &cfg.dip_buy_exit, &tiers,
+                    )
+                    .map(|reason| (reason, pct, pos.peak_pct))
                 } else {
                     None
                 };
@@ -250,10 +261,46 @@ async fn run_session(
 
                 let now = Instant::now();
 
+                // dip_buy entry trigger — derived from monitored-wallet
+                // analysis. Takes precedence over MACD and capitulation.
+                if dip_buy_detector.enabled() {
+                    dip_buy_detector.observe(now, price, pool_sol);
+                    if let Some(reason) = dip_buy_detector.check(now) {
+                        if position.is_some() {
+                            debug!("[{tag}] dip_buy skipped: already in position");
+                        } else if let Some(t) = last_sell_at {
+                            let since = now.duration_since(t);
+                            if since < cooldown {
+                                debug!(
+                                    "[{tag}] dip_buy skipped: cooldown {}s remaining",
+                                    (cooldown - since).as_secs()
+                                );
+                            } else {
+                                info!("[{tag}] DIP_BUY SIGNAL: {reason}");
+                                position = try_buy(
+                                    &cfg, &http, &rpc, &keypair, &open_positions,
+                                    &notifier, &spend_tracker, &mint, &mint_str,
+                                    name.as_deref(), symbol.as_deref(), &tag,
+                                    EntryTrigger::DipBuy, dry_run,
+                                ).await;
+                            }
+                        } else {
+                            info!("[{tag}] DIP_BUY SIGNAL: {reason}");
+                            position = try_buy(
+                                &cfg, &http, &rpc, &keypair, &open_positions,
+                                &notifier, &spend_tracker, &mint, &mint_str,
+                                name.as_deref(), symbol.as_deref(), &tag,
+                                EntryTrigger::DipBuy, dry_run,
+                            ).await;
+                        }
+                    }
+                }
+
                 // Capitulation dip-buy detector — alternative entry mode to
                 // MACD. Per-tick: observe, then check; on fire, run the same
-                // buy gating as the MACD bullish branch.
-                if cap_detector.enabled() {
+                // buy gating as the MACD bullish branch. Suppressed when
+                // dip_buy is the active trigger.
+                if !dip_buy_detector.enabled() && cap_detector.enabled() {
                     cap_detector.observe(now, price);
                     if let Some(reason) = cap_detector.check(now, price) {
                         if position.is_some() {
@@ -269,16 +316,18 @@ async fn run_session(
                                 info!("[{tag}] CAPITULATION SIGNAL: {reason}");
                                 position = try_buy(
                                     &cfg, &http, &rpc, &keypair, &open_positions,
-                                    &notifier, &mint, &mint_str, name.as_deref(),
-                                    symbol.as_deref(), &tag, dry_run,
+                                    &notifier, &spend_tracker, &mint, &mint_str,
+                                    name.as_deref(), symbol.as_deref(), &tag,
+                                    EntryTrigger::Capitulation, dry_run,
                                 ).await;
                             }
                         } else {
                             info!("[{tag}] CAPITULATION SIGNAL: {reason}");
                             position = try_buy(
                                 &cfg, &http, &rpc, &keypair, &open_positions,
-                                &notifier, &mint, &mint_str, name.as_deref(),
-                                symbol.as_deref(), &tag, dry_run,
+                                &notifier, &spend_tracker, &mint, &mint_str,
+                                name.as_deref(), symbol.as_deref(), &tag,
+                                EntryTrigger::Capitulation, dry_run,
                             ).await;
                         }
                     }
@@ -304,7 +353,11 @@ async fn run_session(
                         );
                         match direction {
                             Crossover::Bullish => {
-                                if cap_detector.enabled() {
+                                if dip_buy_detector.enabled() {
+                                    debug!(
+                                        "[{tag}] bullish ignored: dip_buy entry mode is active"
+                                    );
+                                } else if cap_detector.enabled() {
                                     debug!(
                                         "[{tag}] bullish ignored: capitulation entry mode is active"
                                     );
@@ -321,15 +374,17 @@ async fn run_session(
                                     } else {
                                         position = try_buy(
                                             &cfg, &http, &rpc, &keypair, &open_positions,
-                                            &notifier, &mint, &mint_str, name.as_deref(),
-                                            symbol.as_deref(), &tag, dry_run,
+                                            &notifier, &spend_tracker, &mint, &mint_str,
+                                            name.as_deref(), symbol.as_deref(), &tag,
+                                            EntryTrigger::Macd, dry_run,
                                         ).await;
                                     }
                                 } else {
                                     position = try_buy(
                                         &cfg, &http, &rpc, &keypair, &open_positions,
-                                        &notifier, &mint, &mint_str, name.as_deref(),
-                                        symbol.as_deref(), &tag, dry_run,
+                                        &notifier, &spend_tracker, &mint, &mint_str,
+                                        name.as_deref(), symbol.as_deref(), &tag,
+                                        EntryTrigger::Macd, dry_run,
                                     ).await;
                                 }
                             }
@@ -389,13 +444,33 @@ async fn try_buy(
     keypair: &Keypair,
     open_positions: &AtomicUsize,
     notifier: &Notifier,
+    spend_tracker: &SharedSpendTracker,
     mint: &Pubkey,
     mint_str: &str,
     name: Option<&str>,
     symbol: Option<&str>,
     tag: &str,
+    trigger: EntryTrigger,
     dry_run: bool,
 ) -> Option<Position> {
+    let amount_sol = cfg.trading.trade_amount as f64 / LAMPORTS_PER_SOL as f64;
+
+    // dip_buy-only: enforce the 24h spend cap BEFORE reserving a slot or
+    // touching RPC. Counts dry-run and live spending alike so the cap is
+    // testable end-to-end. A breach here suppresses this fire entirely;
+    // the session keeps polling but this signal is dropped.
+    if trigger == EntryTrigger::DipBuy {
+        let now = Instant::now();
+        let mut tracker = spend_tracker.lock().expect("spend tracker mutex poisoned");
+        if let Err(spent) = tracker.check(now, amount_sol) {
+            warn!(
+                "[{tag}] dip_buy BLOCKED by daily cap: would spend {:.3} SOL but {:.3}/{:.2} already spent in last 24h",
+                amount_sol, spent, tracker.cap()
+            );
+            return None;
+        }
+    }
+
     // Reserve a slot first; release on any failure path.
     let slot = open_positions.fetch_add(1, Ordering::SeqCst);
     if slot >= cfg.trading.max_positions as usize {
@@ -407,7 +482,6 @@ async fn try_buy(
         return None;
     }
 
-    let amount_sol = cfg.trading.trade_amount as f64 / LAMPORTS_PER_SOL as f64;
     let buy_res = trader::buy(
         http,
         rpc,
@@ -425,8 +499,31 @@ async fn try_buy(
     .await;
 
     let sig = match buy_res {
-        Ok(Some(sig)) => sig,
+        Ok(Some(sig)) => {
+            // Live buy succeeded — record toward the daily cap for dip_buy.
+            if trigger == EntryTrigger::DipBuy {
+                let mut tracker = spend_tracker.lock().expect("spend tracker mutex poisoned");
+                tracker.record(Instant::now(), amount_sol);
+                let total = tracker.total_24h(Instant::now());
+                info!(
+                    "[{tag}] dip_buy spend recorded: {:.3} SOL (24h total {:.3}/{:.2})",
+                    amount_sol, total, tracker.cap()
+                );
+            }
+            sig
+        }
         Ok(None) => {
+            // Dry-run still counts toward the cap so the gating logic is
+            // verifiable before flipping live. Reserved slot is released.
+            if trigger == EntryTrigger::DipBuy {
+                let mut tracker = spend_tracker.lock().expect("spend tracker mutex poisoned");
+                tracker.record(Instant::now(), amount_sol);
+                let total = tracker.total_24h(Instant::now());
+                info!(
+                    "[{tag}] dip_buy (dry-run) spend recorded: {:.3} SOL (24h total {:.3}/{:.2})",
+                    amount_sol, total, tracker.cap()
+                );
+            }
             info!("[{tag}] BUY (dry-run) — no real position tracked");
             open_positions.fetch_sub(1, Ordering::SeqCst);
             return None;
@@ -496,6 +593,7 @@ async fn try_buy(
         cost_sol: amount_sol,
         peak_pct: 0.0,
         bought_at,
+        entry_trigger: trigger,
     })
 }
 
