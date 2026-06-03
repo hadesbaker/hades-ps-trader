@@ -137,6 +137,7 @@ async fn run_session(
     let mut aggregator = CandleAggregator::new(candle_interval);
     let mut macd = Macd::new(cfg.macd.fast, cfg.macd.slow, cfg.macd.signal);
     let tiers = position::parse_tiers(&cfg.trading.dynamic_trailing_stop_thresholds);
+    let dip_buy_tiers = position::parse_tiers(&cfg.dip_buy_exit.trail_tiers);
 
     let mut position: Option<Position> = None;
     let mut last_sell_at: Option<Instant> = None;
@@ -144,7 +145,7 @@ async fn run_session(
     let mut tick: u64 = 0;
     let mut rug_guard = RugGuard::new();
     let mut cap_detector = CapitulationDetector::new(&cfg.capitulation);
-    let mut dip_buy_detector = DipBuyDetector::new(&cfg.dip_buy);
+    let mut dip_buy_detector = DipBuyDetector::new(&cfg.dip_buy, session_start);
     if dip_buy_detector.enabled() {
         info!(
             "[{tag}] dip_buy entry ENABLED — MACD + capitulation will not trigger buys"
@@ -228,7 +229,8 @@ async fn run_session(
                     }
                     let elapsed_secs = pos.bought_at.elapsed().as_secs();
                     position::decide_exit(
-                        pos, pct, elapsed_secs, &cfg.trading, &cfg.dip_buy_exit, &tiers,
+                        pos, pct, elapsed_secs, &cfg.trading, &cfg.dip_buy_exit,
+                        &tiers, &dip_buy_tiers,
                     )
                     .map(|reason| (reason, pct, pos.peak_pct))
                 } else {

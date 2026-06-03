@@ -94,20 +94,25 @@ pub fn decide_exit(
     elapsed_secs: u64,
     cfg: &Trading,
     dip_buy_exit: &DipBuyExitConfig,
-    tiers: &[TrailTier],
+    universal_tiers: &[TrailTier],
+    dip_buy_tiers: &[TrailTier],
 ) -> Option<ExitReason> {
     match pos.entry_trigger {
-        EntryTrigger::DipBuy => decide_exit_dip_buy(current_pct, elapsed_secs, dip_buy_exit),
+        EntryTrigger::DipBuy => {
+            decide_exit_dip_buy(pos, current_pct, elapsed_secs, dip_buy_exit, dip_buy_tiers)
+        }
         EntryTrigger::Macd | EntryTrigger::Capitulation => {
-            decide_exit_universal(pos, current_pct, elapsed_secs, cfg, tiers)
+            decide_exit_universal(pos, current_pct, elapsed_secs, cfg, universal_tiers)
         }
     }
 }
 
 fn decide_exit_dip_buy(
+    pos: &Position,
     current_pct: f64,
     elapsed_secs: u64,
     cfg: &DipBuyExitConfig,
+    tiers: &[TrailTier],
 ) -> Option<ExitReason> {
     // Time-stop first — empirically the matching loser in validation held
     // 1283s; this cap would have killed it well before -27%.
@@ -117,6 +122,21 @@ fn decide_exit_dip_buy(
     if cfg.stop_loss_pct > 0.0 && current_pct <= -cfg.stop_loss_pct {
         return Some(ExitReason::StopLoss { pct: current_pct });
     }
+    // Dynamic trailing stop — primary exit for winners. Lets a +50% peak
+    // ride to +200% if it keeps going, instead of capping at a fixed TP.
+    if let Some(tier) = tiers.iter().rev().find(|t| pos.peak_pct >= t.gain_pct) {
+        let trigger = pos.peak_pct - tier.trail_pct;
+        if current_pct <= trigger {
+            return Some(ExitReason::DynamicTrail {
+                tier_gain: tier.gain_pct,
+                trail: tier.trail_pct,
+                trigger_at_pct: trigger,
+                current_pct,
+            });
+        }
+    }
+    // Hard TP ceiling — safety stop in case price spikes past the highest
+    // trail tier without triggering it. Set high in defaults (300%).
     if cfg.take_profit_pct > 0.0 && current_pct >= cfg.take_profit_pct {
         return Some(ExitReason::TakeProfit { pct: current_pct });
     }

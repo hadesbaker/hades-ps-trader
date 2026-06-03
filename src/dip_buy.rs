@@ -33,8 +33,20 @@ pub struct DipBuyDetector {
     min_drawdown_pct: f64,
     max_entry_quantile: f64,
     min_pool_sol_drawdown_pct: f64,
+    max_pool_sol_drawdown_pct: f64,
     min_pool_sol: f64,
     cooldown: Duration,
+    // Pre-buy rug filter: pool must show TVL recovery over the recent window.
+    pool_recovery_secs: u64,
+    pool_recovery_pct: f64,
+    // Pre-buy rug filter: price must show bounce off recent low.
+    price_recovery_secs: u64,
+    price_recovery_pct: f64,
+    // Session-age filter: reject fires past this many seconds into the session.
+    // Yesterday's data: all 8 winners ≤643s, 4/11 losers >643s including the
+    // -88% rug at 5261s. Set 0 to disable.
+    max_session_age_secs: u64,
+    session_start: Instant,
 
     // (timestamp, price_sol, pool_sol)
     ticks: VecDeque<(Instant, f64, f64)>,
@@ -42,15 +54,22 @@ pub struct DipBuyDetector {
 }
 
 impl DipBuyDetector {
-    pub fn new(cfg: &DipBuyConfig) -> Self {
+    pub fn new(cfg: &DipBuyConfig, session_start: Instant) -> Self {
         Self {
             enabled: cfg.enabled,
             window: Duration::from_secs(cfg.window_secs),
             min_drawdown_pct: cfg.min_drawdown_pct,
             max_entry_quantile: cfg.max_entry_quantile,
             min_pool_sol_drawdown_pct: cfg.min_pool_sol_drawdown_pct,
+            max_pool_sol_drawdown_pct: cfg.max_pool_sol_drawdown_pct,
             min_pool_sol: cfg.min_pool_sol,
             cooldown: Duration::from_secs(cfg.cooldown_secs),
+            pool_recovery_secs: cfg.pool_recovery_secs,
+            pool_recovery_pct: cfg.pool_recovery_pct,
+            price_recovery_secs: cfg.price_recovery_secs,
+            price_recovery_pct: cfg.price_recovery_pct,
+            max_session_age_secs: cfg.max_session_age_secs,
+            session_start,
             ticks: VecDeque::new(),
             last_fire: None,
         }
@@ -89,6 +108,15 @@ impl DipBuyDetector {
                 return None;
             }
         }
+        // Session-age filter — late fires (post-discovery, post-pump) are
+        // empirically the worst rug risk. Yesterday's -88% rug fired 88
+        // minutes after the session started.
+        if self.max_session_age_secs > 0 {
+            let age = now.duration_since(self.session_start).as_secs();
+            if age > self.max_session_age_secs {
+                return None;
+            }
+        }
         if self.ticks.len() < MIN_TICKS_FOR_FIRE {
             return None;
         }
@@ -118,17 +146,67 @@ impl DipBuyDetector {
         let quantile = (entry_price - min_price) / (max_price - min_price);
         let pool_drawdown_pct = (max_pool_sol - entry_pool_sol) / max_pool_sol;
 
-        if drawdown_pct >= self.min_drawdown_pct
+        // Core dip criteria — same as before.
+        if !(drawdown_pct >= self.min_drawdown_pct
             && quantile <= self.max_entry_quantile
-            && pool_drawdown_pct >= self.min_pool_sol_drawdown_pct
+            && pool_drawdown_pct >= self.min_pool_sol_drawdown_pct)
         {
-            self.last_fire = Some(now);
-            return Some(format!(
-                "drawdown={:.2} quantile={:.2} pool_drain={:.2} pool_sol={:.1}",
-                drawdown_pct, quantile, pool_drawdown_pct, entry_pool_sol
-            ));
+            return None;
         }
-        None
+
+        // Pre-buy rug filter #1: cap on how badly the pool has drained.
+        // Beyond this, the pool isn't dipping — it's dying. The 6 rugs from
+        // the first live run all had pool_drain ≥ 0.20 at fire AND went on
+        // to drain further toward zero.
+        if self.max_pool_sol_drawdown_pct > 0.0
+            && pool_drawdown_pct > self.max_pool_sol_drawdown_pct
+        {
+            return None;
+        }
+
+        // Pre-buy rug filter #2: require pool TVL to have bounced off its
+        // recent low. If the pool is still draining at fire time, we're
+        // catching a falling knife — exactly the failure mode we saw live.
+        if self.pool_recovery_secs > 0 {
+            let recovery_window = Duration::from_secs(self.pool_recovery_secs);
+            let cutoff = now.checked_sub(recovery_window);
+            let mut min_pool_recent = f64::INFINITY;
+            for &(ts, _, ps) in &self.ticks {
+                if cutoff.map_or(true, |c| ts >= c) && ps < min_pool_recent {
+                    min_pool_recent = ps;
+                }
+            }
+            if min_pool_recent.is_finite()
+                && entry_pool_sol < min_pool_recent * (1.0 + self.pool_recovery_pct)
+            {
+                return None;
+            }
+        }
+
+        // Pre-buy rug filter #3: require price to have bounced off its
+        // recent low. Together with pool recovery, this is the "wait for
+        // reclaim" pattern from the capitulation detector.
+        if self.price_recovery_secs > 0 {
+            let recovery_window = Duration::from_secs(self.price_recovery_secs);
+            let cutoff = now.checked_sub(recovery_window);
+            let mut min_price_recent = f64::INFINITY;
+            for &(ts, p, _) in &self.ticks {
+                if cutoff.map_or(true, |c| ts >= c) && p < min_price_recent {
+                    min_price_recent = p;
+                }
+            }
+            if min_price_recent.is_finite()
+                && entry_price < min_price_recent * (1.0 + self.price_recovery_pct)
+            {
+                return None;
+            }
+        }
+
+        self.last_fire = Some(now);
+        Some(format!(
+            "drawdown={:.2} quantile={:.2} pool_drain={:.2} pool_sol={:.1}",
+            drawdown_pct, quantile, pool_drawdown_pct, entry_pool_sol
+        ))
     }
 }
 

@@ -209,9 +209,15 @@ pub struct DipBuyConfig {
     /// Required price drawdown from window max to current price.
     pub min_drawdown_pct: f64,
     /// Current price must be at or below this quantile of [min, max] in window.
+    /// Tightened from 0.30 → 0.20 after live data showed all real fires landed
+    /// at quantile 0.00, so 0.20 still admits every real signal while reducing
+    /// false positives on shallow consolidations.
     pub max_entry_quantile: f64,
     /// Required TVL drain from window max — confirms real sells.
     pub min_pool_sol_drawdown_pct: f64,
+    /// MAX allowed TVL drain. Beyond this, the pool is dying (rug), not
+    /// dipping. 0 disables. Set near the upper edge of normal-dip drains.
+    pub max_pool_sol_drawdown_pct: f64,
     /// Pool size floor at entry — avoid micro-pools.
     pub min_pool_sol: f64,
     /// Post-fire cooldown per session.
@@ -219,6 +225,21 @@ pub struct DipBuyConfig {
     /// Rolling 24h cap on cumulative dip_buy spending. Bug-protection,
     /// independent of strategy risk.
     pub daily_spend_cap_sol: f64,
+    /// Pre-buy rug filter — pool TVL recovery. Pool_sol at entry must be at
+    /// least `pool_recovery_pct` ABOVE the minimum pool_sol observed in the
+    /// last `pool_recovery_secs` seconds. 0 secs disables. Targets the
+    /// "wait for reclaim" pattern: don't fire while the pool is still draining.
+    pub pool_recovery_secs: u64,
+    pub pool_recovery_pct: f64,
+    /// Pre-buy rug filter — price recovery. Same idea as pool_recovery, for
+    /// the token price. Both filters together require the dip to have BOTH
+    /// stabilized AND bounced before dip_buy will fire.
+    pub price_recovery_secs: u64,
+    pub price_recovery_pct: f64,
+    /// Reject fires when (now - session_start) exceeds this. Empirically the
+    /// late-session fires are the worst rug risk — yesterday's -88% rug
+    /// fired 88 min into its session. 0 disables.
+    pub max_session_age_secs: u64,
 }
 
 impl Default for DipBuyConfig {
@@ -227,11 +248,17 @@ impl Default for DipBuyConfig {
             enabled: false,
             window_secs: 60,
             min_drawdown_pct: 0.30,
-            max_entry_quantile: 0.30,
+            max_entry_quantile: 0.20,
             min_pool_sol_drawdown_pct: 0.20,
+            max_pool_sol_drawdown_pct: 0.45,
             min_pool_sol: 30.0,
             cooldown_secs: 60,
             daily_spend_cap_sol: 2.0,
+            pool_recovery_secs: 8,
+            pool_recovery_pct: 0.03,
+            price_recovery_secs: 5,
+            price_recovery_pct: 0.05,
+            max_session_age_secs: 600,
         }
     }
 }
@@ -249,17 +276,26 @@ impl Default for DipBuyConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DipBuyExitConfig {
+    /// Hard take-profit ceiling. Acts as a safety stop; primary exit on
+    /// winners is the dynamic trailing stop below. Set high (e.g. 300%)
+    /// to effectively disable.
     pub take_profit_pct: f64,
     pub stop_loss_pct: f64,
     pub max_hold_secs: u64,
+    /// Dynamic trailing stop for dip_buy winners, same format as
+    /// [trading].dynamic_trailing_stop_thresholds. Once peak PnL crosses a
+    /// tier's gain, exit when PnL drops `trail%` from peak. Replaces the
+    /// fixed-TP behavior — lets winners ride past +75% with a trail.
+    pub trail_tiers: String,
 }
 
 impl Default for DipBuyExitConfig {
     fn default() -> Self {
         Self {
-            take_profit_pct: 75.0,
+            take_profit_pct: 300.0,
             stop_loss_pct: 25.0,
             max_hold_secs: 600,
+            trail_tiers: "20:6,40:10,75:15,100:20,150:25,200:30".to_string(),
         }
     }
 }
