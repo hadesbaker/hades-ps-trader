@@ -28,6 +28,58 @@ pub struct Config {
     /// fields. Defaults match the empirically-derived strategy spec.
     #[serde(default)]
     pub dip_buy_exit: DipBuyExitConfig,
+    /// Copy-trade entry mode: mirror live BUYs from followed alpha wallets
+    /// (PumpPortal `subscribeAccountTrade`) and manage each position with our
+    /// own mechanical exit. Followed wallet addresses come from the
+    /// `COPY_TRADE_WALLETS` env var (comma-separated) — NOT this file — to keep
+    /// the research-subject wallets out of the committed public repo.
+    #[serde(default)]
+    pub copy_trade: CopyTradeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CopyTradeConfig {
+    pub enabled: bool,
+    /// SOL per copied entry.
+    pub trade_amount_sol: f64,
+    /// Max concurrent copy positions (independent of `[trading].max_positions`).
+    pub max_positions: u64,
+    /// Rolling 24h spend cap (SOL) across copy entries — bug protection.
+    pub daily_spend_cap_sol: f64,
+    /// Ignore a mint we entered/exited within this many seconds (dedup/anti-churn).
+    pub reentry_cooldown_secs: u64,
+    /// Ignore a followed wallet's buys within this many seconds of its last
+    /// copied buy — stops one hyperactive (bot/MM) wallet from dominating the
+    /// daily cap and starving slower, higher-quality alphas.
+    pub per_wallet_cooldown_secs: u64,
+    /// Only follow an alpha BUY if the pool TVL (SOL) at entry is at least this.
+    pub min_pool_sol: f64,
+    /// Seconds to hold a copy position before force-selling. 0 = monitor indefinitely.
+    pub max_hold_secs: u64,
+    /// Hard stop-loss percent for copy positions.
+    pub stop_loss_pct: f64,
+    /// Trailing-stop tiers "gain:trail,..." for copy positions.
+    pub trail_tiers: String,
+    /// Take-profit ceiling percent (safety; high = effectively trailing-only).
+    pub take_profit_pct: f64,
+}
+
+impl Default for CopyTradeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trade_amount_sol: 0.1,
+            max_positions: 5,
+            daily_spend_cap_sol: 2.0,
+            reentry_cooldown_secs: 300,
+            per_wallet_cooldown_secs: 60,
+            min_pool_sol: 30.0,
+            max_hold_secs: 900,
+            stop_loss_pct: 20.0,
+            trail_tiers: "20:6,40:10,75:15,100:20,150:25,200:30".to_string(),
+            take_profit_pct: 300.0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

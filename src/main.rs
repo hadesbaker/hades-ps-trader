@@ -1,5 +1,6 @@
 mod capitulation;
 mod config;
+mod copy_session;
 mod dip_buy;
 mod discord;
 mod macd;
@@ -17,7 +18,7 @@ use crate::config::{BoxError, Config};
 use crate::dip_buy::{DailySpendTracker, SharedSpendTracker};
 use crate::discord::Notifier;
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signer;
@@ -104,7 +105,6 @@ async fn main() -> Result<(), BoxError> {
         _ => "wss://pumpportal.fun/api/data".to_string(),
     };
 
-    let mut migrations = pumpportal::spawn_migration_listener(ws_url.clone());
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
@@ -119,6 +119,96 @@ async fn main() -> Result<(), BoxError> {
         info!("discord notifications disabled (DISCORD_WEBHOOK_URL not set)");
     }
 
+    // ---- copy-trade mode: mirror followed alpha wallets' live PumpSwap buys ----
+    // When enabled, this REPLACES the graduation/dip_buy path entirely. Followed
+    // wallet addresses come from the COPY_TRADE_WALLETS env (gitignored), never
+    // the committed config.
+    if cfg.copy_trade.enabled {
+        let wallets: Vec<String> = std::env::var("COPY_TRADE_WALLETS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if wallets.is_empty() {
+            error!("copy_trade.enabled but COPY_TRADE_WALLETS is empty; nothing to follow. Exiting.");
+            return Ok(());
+        }
+        info!(
+            "COPY-TRADE MODE — following {} wallet(s); size={} SOL, max_positions={}, 24h cap={} SOL, reentry_cooldown={}s",
+            wallets.len(),
+            cfg.copy_trade.trade_amount_sol,
+            cfg.copy_trade.max_positions,
+            cfg.copy_trade.daily_spend_cap_sol,
+            cfg.copy_trade.reentry_cooldown_secs,
+        );
+
+        let copy_positions = Arc::new(AtomicUsize::new(0));
+        let spend_tracker: SharedSpendTracker = Arc::new(std::sync::Mutex::new(
+            DailySpendTracker::new(cfg.copy_trade.daily_spend_cap_sol),
+        ));
+        let recent: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let recent_wallet: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let cooldown = std::time::Duration::from_secs(cfg.copy_trade.reentry_cooldown_secs);
+        let wallet_cooldown = std::time::Duration::from_secs(cfg.copy_trade.per_wallet_cooldown_secs);
+
+        let mut trades = pumpportal::spawn_account_trade_listener(ws_url.clone(), wallets);
+        info!("hades-ps-trader running. Following alpha buys…");
+
+        while let Some(t) = trades.recv().await {
+            if t.tx_type != "buy" {
+                continue; // v1: enter on alpha buys; our own exit handles selling
+            }
+            if !t.is_pumpswap {
+                debug!("copy skip {}: not a PumpSwap (pump-amm) trade", t.mint);
+                continue;
+            }
+            // Per-wallet cooldown — one hyperactive wallet can't dominate the cap.
+            {
+                let mut wmap = recent_wallet.lock().expect("recent_wallet map poisoned");
+                let now = std::time::Instant::now();
+                if let Some(&last) = wmap.get(&t.trader) {
+                    if now.duration_since(last) < wallet_cooldown {
+                        debug!("copy skip {}: wallet {} cooldown", t.mint, t.trader);
+                        continue;
+                    }
+                }
+                wmap.insert(t.trader.clone(), now);
+            }
+            // Per-mint dedup / re-entry cooldown.
+            {
+                let mut map = recent.lock().expect("recent map poisoned");
+                let now = std::time::Instant::now();
+                if let Some(&last) = map.get(&t.mint) {
+                    if now.duration_since(last) < cooldown {
+                        debug!("copy skip {}: re-entry cooldown", t.mint);
+                        continue;
+                    }
+                }
+                map.insert(t.mint.clone(), now);
+            }
+            let cfg2 = cfg.clone();
+            let http2 = http.clone();
+            let rpc2 = rpc.clone();
+            let kp2 = keypair.clone();
+            let positions2 = copy_positions.clone();
+            let spend2 = spend_tracker.clone();
+            let notifier2 = notifier.clone();
+            let dry = args.dry_run;
+            tokio::spawn(async move {
+                copy_session::copy_handle(
+                    cfg2, http2, rpc2, kp2, positions2, spend2, notifier2, t, dry,
+                )
+                .await;
+            });
+        }
+        error!("PumpPortal account-trade channel closed; exiting.");
+        return Ok(());
+    }
+
+    let mut migrations = pumpportal::spawn_migration_listener(ws_url.clone());
     let open_positions = Arc::new(AtomicUsize::new(0));
 
     // Shared rolling-24h cap on dip_buy spending. Bug protection — refuses

@@ -75,3 +75,104 @@ fn extract_mint(v: &Value) -> Option<String> {
     }
     None
 }
+
+// ----- copy-trade feed: live trades from followed alpha wallets -----
+
+/// One live trade by a followed wallet, as seen on `subscribeAccountTrade`.
+#[derive(Debug, Clone)]
+pub struct AlphaTrade {
+    pub mint: String,
+    /// The followed wallet that made this trade.
+    pub trader: String,
+    /// `"buy"` or `"sell"`.
+    pub tx_type: String,
+    /// True when the trade hit a PumpSwap (`pump-amm`) pool — the only venue
+    /// we can execute on in v1. BC (`pump`) trades are surfaced but skipped.
+    pub is_pumpswap: bool,
+    pub symbol: Option<String>,
+}
+
+/// Subscribe to live trades for `wallet_keys`. One `AlphaTrade` per parseable
+/// buy/sell frame. Reconnects with backoff, mirroring the migration listener.
+pub fn spawn_account_trade_listener(
+    ws_url: String,
+    wallet_keys: Vec<String>,
+) -> mpsc::UnboundedReceiver<AlphaTrade> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        if wallet_keys.is_empty() {
+            warn!("copy: no followed wallets; account-trade listener exiting");
+            return;
+        }
+        let mut backoff = 1u64;
+        loop {
+            match run_account_trade(&ws_url, &wallet_keys, &tx).await {
+                Ok(()) => info!("account-trade ws closed; reconnecting in {backoff}s"),
+                Err(e) => error!("account-trade ws error: {e}; reconnecting in {backoff}s"),
+            }
+            sleep(Duration::from_secs(backoff)).await;
+            backoff = backoff.saturating_mul(2).min(30);
+        }
+    });
+    rx
+}
+
+async fn run_account_trade(
+    ws_url: &str,
+    wallet_keys: &[String],
+    tx: &mpsc::UnboundedSender<AlphaTrade>,
+) -> Result<(), BoxError> {
+    let (ws, _) = connect_async(ws_url).await?;
+    let (mut write, mut read) = ws.split();
+
+    let sub = json!({ "method": "subscribeAccountTrade", "keys": wallet_keys }).to_string();
+    write.send(Message::Text(sub)).await?;
+    info!(
+        "subscribed: subscribeAccountTrade for {} followed wallet(s)",
+        wallet_keys.len()
+    );
+
+    while let Some(msg) = read.next().await {
+        match msg? {
+            Message::Text(text) => {
+                let v: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("non-JSON account-trade frame: {e} :: {text}");
+                        continue;
+                    }
+                };
+                if v.get("message").is_some() || v.get("errors").is_some() {
+                    debug!("account-trade control frame: {v}");
+                    continue;
+                }
+                if let Some(t) = parse_trade_frame(&v) {
+                    if tx.send(t).is_err() {
+                        return Ok(()); // receiver dropped
+                    }
+                }
+            }
+            Message::Ping(p) => write.send(Message::Pong(p)).await?,
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_trade_frame(v: &Value) -> Option<AlphaTrade> {
+    let mint = v.get("mint")?.as_str()?.to_string();
+    let trader = v.get("traderPublicKey")?.as_str()?.to_string();
+    let tx_type = v.get("txType")?.as_str()?.to_string();
+    if tx_type != "buy" && tx_type != "sell" {
+        return None;
+    }
+    let is_pumpswap = v.get("pool").and_then(Value::as_str) == Some("pump-amm");
+    Some(AlphaTrade {
+        mint,
+        trader,
+        tx_type,
+        is_pumpswap,
+        symbol: v.get("symbol").and_then(Value::as_str).map(str::to_string),
+    })
+}
