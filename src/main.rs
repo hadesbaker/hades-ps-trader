@@ -36,6 +36,11 @@ struct Args {
     /// Path to config TOML.
     #[arg(long, default_value = "config.toml")]
     config: String,
+
+    /// Liquidate mode: comma-separated mint addresses to sell 100% of and then
+    /// exit. Reuses the normal sell path. Ignores copy/graduation modes.
+    #[arg(long)]
+    liquidate: Option<String>,
 }
 
 #[tokio::main]
@@ -83,6 +88,9 @@ async fn main() -> Result<(), BoxError> {
         warn!("--dry-run is ON: buys and sells will not be submitted");
     }
 
+    // Initialize Jito bundle submission (no-op unless [jito].enabled = true).
+    trader::init_jito(&cfg.jito);
+
     let keypair = Arc::new(wallet::load(&cfg.wallet_path)?);
     info!("wallet pubkey: {}", keypair.pubkey());
 
@@ -117,6 +125,47 @@ async fn main() -> Result<(), BoxError> {
         info!("discord notifications enabled");
     } else {
         info!("discord notifications disabled (DISCORD_WEBHOOK_URL not set)");
+    }
+
+    // ---- liquidate mode: sell 100% of the given mints, then exit ----
+    if let Some(mints) = args.liquidate.clone() {
+        let list: Vec<String> = mints
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        info!("LIQUIDATE MODE — selling {} mint(s), then exiting", list.len());
+        let mut ok = 0usize;
+        for mint in &list {
+            info!("liquidating {mint}…");
+            match trader::sell_all(
+                &http,
+                &rpc,
+                &keypair,
+                trader::SellAllParams {
+                    mint,
+                    symbol: None,
+                    slippage_pct: cfg.trading.slippage,
+                    priority_fee_sol: cfg.trading.priority_fee_sol,
+                    max_retries: cfg.trading.sell_tx_retries,
+                },
+                args.dry_run,
+            )
+            .await
+            {
+                Ok(Some(sig)) => {
+                    ok += 1;
+                    info!("liquidated {mint}: {sig}");
+                }
+                Ok(None) => info!("liquidate {mint}: dry-run (no tx sent)"),
+                Err(e) => error!("liquidate {mint} FAILED: {e}"),
+            }
+        }
+        match onchain::fetch_sol_balance(&rpc, &keypair.pubkey()).await {
+            Ok(sol) => info!("liquidate done ({ok}/{} ok); wallet balance: {sol:.5} SOL", list.len()),
+            Err(e) => warn!("liquidate done ({ok}/{} ok); balance fetch failed: {e}", list.len()),
+        }
+        return Ok(());
     }
 
     // ---- copy-trade mode: mirror followed alpha wallets' live PumpSwap buys ----
@@ -155,11 +204,67 @@ async fn main() -> Result<(), BoxError> {
         let wallet_cooldown = std::time::Duration::from_secs(cfg.copy_trade.per_wallet_cooldown_secs);
 
         let mut trades = pumpportal::spawn_account_trade_listener(ws_url.clone(), wallets);
+
+        // Sell broadcast: every followed-wallet SELL is fanned out to all open
+        // copy positions so a position mirror-exits when the alpha that we
+        // followed in closes the mint. Each copy_handle filters for its own
+        // mint + entry wallet. Capacity is generous — sells are low-frequency.
+        let (sell_tx, _sell_rx0) =
+            tokio::sync::broadcast::channel::<pumpportal::AlphaTrade>(1024);
+        if cfg.copy_trade.mirror_exit {
+            info!(
+                "MIRROR-EXIT enabled — positions sell when the followed alpha closes the mint (close_fraction={}, first_sell={}, max_hold backstop={}s); trailing/TP disabled",
+                cfg.copy_trade.mirror_close_fraction,
+                cfg.copy_trade.mirror_exit_on_first_sell,
+                cfg.copy_trade.mirror_max_hold_secs,
+            );
+        }
+        // Graceful shutdown: on SIGTERM/Ctrl-C, tell every open copy position to
+        // force-sell so we don't orphan tokens when stopping between iterations.
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(8);
         info!("hades-ps-trader running. Following alpha buys…");
 
-        while let Some(t) = trades.recv().await {
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            let t = tokio::select! {
+                maybe = trades.recv() => match maybe {
+                    Some(t) => t,
+                    None => {
+                        error!("PumpPortal account-trade channel closed; exiting.");
+                        break;
+                    }
+                },
+                _ = &mut shutdown => {
+                    let n = copy_positions.load(std::sync::atomic::Ordering::SeqCst);
+                    warn!("shutdown signal — telling {n} open copy position(s) to force-sell; waiting up to 25s");
+                    let _ = shutdown_tx.send(());
+                    for _ in 0..25 {
+                        if copy_positions.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    let left = copy_positions.load(std::sync::atomic::Ordering::SeqCst);
+                    if left > 0 {
+                        error!("{left} copy position(s) may not have closed cleanly — check the wallet");
+                    } else {
+                        info!("all copy positions closed; exiting cleanly");
+                    }
+                    break;
+                }
+            };
+            if t.tx_type == "sell" {
+                // Fan out to any open copy position holding this mint.
+                debug!(
+                    "sell frame: {} by {} newTokenBalance={:?} pump_swap={}",
+                    t.mint, t.trader, t.token_balance, t.is_pumpswap
+                );
+                let _ = sell_tx.send(t);
+                continue;
+            }
             if t.tx_type != "buy" {
-                continue; // v1: enter on alpha buys; our own exit handles selling
+                continue; // ignore non-trade frames
             }
             if !t.is_pumpswap {
                 debug!("copy skip {}: not a PumpSwap (pump-amm) trade", t.mint);
@@ -196,15 +301,16 @@ async fn main() -> Result<(), BoxError> {
             let positions2 = copy_positions.clone();
             let spend2 = spend_tracker.clone();
             let notifier2 = notifier.clone();
+            let mirror_rx = sell_tx.subscribe();
+            let shutdown_rx = shutdown_tx.subscribe();
             let dry = args.dry_run;
             tokio::spawn(async move {
                 copy_session::copy_handle(
-                    cfg2, http2, rpc2, kp2, positions2, spend2, notifier2, t, dry,
+                    cfg2, http2, rpc2, kp2, positions2, spend2, notifier2, t, mirror_rx, shutdown_rx, dry,
                 )
                 .await;
             });
         }
-        error!("PumpPortal account-trade channel closed; exiting.");
         return Ok(());
     }
 
@@ -259,6 +365,31 @@ async fn main() -> Result<(), BoxError> {
 
     error!("PumpPortal listener channel closed; exiting.");
     Ok(())
+}
+
+/// Resolves on the first SIGTERM or Ctrl-C (SIGINT). Used to trigger graceful
+/// shutdown of open copy positions before the process exits.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("could not install SIGTERM handler: {e}; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Lowest `gain%` among the configured trailing-stop tiers, or +∞ if none.

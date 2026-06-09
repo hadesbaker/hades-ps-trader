@@ -90,6 +90,10 @@ pub struct AlphaTrade {
     /// we can execute on in v1. BC (`pump`) trades are surfaced but skipped.
     pub is_pumpswap: bool,
     pub symbol: Option<String>,
+    /// The trader's UI token balance AFTER this trade, if PumpPortal supplies
+    /// it (`newTokenBalance`). On a copied BUY this is their post-entry balance;
+    /// on a SELL it lets us detect a full close (balance → ~0) for mirror-exit.
+    pub token_balance: Option<f64>,
 }
 
 /// Subscribe to live trades for `wallet_keys`. One `AlphaTrade` per parseable
@@ -174,5 +178,6 @@ fn parse_trade_frame(v: &Value) -> Option<AlphaTrade> {
         tx_type,
         is_pumpswap,
         symbol: v.get("symbol").and_then(Value::as_str).map(str::to_string),
+        token_balance: v.get("newTokenBalance").and_then(Value::as_f64),
     })
 }

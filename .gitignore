@@ -1,5 +1,6 @@
 /target
 .env
+.env.bak*
 config.toml
 wallet.json
 /logs/

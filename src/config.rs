@@ -35,6 +35,36 @@ pub struct Config {
     /// the research-subject wallets out of the committed public repo.
     #[serde(default)]
     pub copy_trade: CopyTradeConfig,
+    /// Jito bundle submission. When enabled, signed trade txs are submitted as a
+    /// single-tx bundle to the Jito block engine (atomic single-block landing)
+    /// instead of a plain RPC `sendTransaction`. Cost-attack lever: cuts the
+    /// decide→land half of adverse selection. The `tip_sol` is paid via the
+    /// priorityFee of the (first) bundled tx — PumpPortal builds the tip in when
+    /// the trade-local request is an array. Falls back to RPC send if the bundle
+    /// submission errors. If the section is omitted, Jito is DISABLED.
+    #[serde(default)]
+    pub jito: JitoConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JitoConfig {
+    pub enabled: bool,
+    /// Jito tip in SOL, paid as the priorityFee of the bundled tx. Ordering on
+    /// the block engine is by tip; ~0.0003-0.001 buys fast inclusion and
+    /// replaces the need for a high regular priority fee.
+    pub tip_sol: f64,
+    /// Jito block-engine bundles endpoint.
+    pub block_engine_url: String,
+}
+
+impl Default for JitoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tip_sol: 0.0003,
+            block_engine_url: "https://mainnet.block-engine.jito.wtf/api/v1/bundles".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,6 +92,45 @@ pub struct CopyTradeConfig {
     pub trail_tiers: String,
     /// Take-profit ceiling percent (safety; high = effectively trailing-only).
     pub take_profit_pct: f64,
+    /// MIRROR-EXIT mode. When true, the primary exit is "sell when the alpha we
+    /// followed closes the mint" — the offline backtest showed the alphas' edge
+    /// is in their EXIT timing, so our mechanical trailing/TP cut winners short.
+    /// In mirror mode, `trail_tiers` and `take_profit_pct` are IGNORED; only the
+    /// rug guard, `stop_loss_pct`, and `mirror_max_hold_secs` remain as safety
+    /// backstops. When false, the legacy mechanical exit applies and sells from
+    /// followed wallets are ignored.
+    #[serde(default = "default_mirror_exit")]
+    pub mirror_exit: bool,
+    /// In mirror mode, exit on the entry wallet's FIRST sell of the mint instead
+    /// of waiting for a full close. Effectively REQUIRED: PumpPortal's
+    /// subscribeAccountTrade sell frames do not carry `newTokenBalance`, so a
+    /// partial-vs-full close can't be told apart from the frame. Also latency-
+    /// favourable (we're "last out") and 91% of alpha sells are full closes.
+    #[serde(default = "default_mirror_exit_on_first_sell")]
+    pub mirror_exit_on_first_sell: bool,
+    /// In mirror mode (full-close detection), treat the alpha as "closed" once
+    /// their post-sell balance drops to this fraction of their post-entry
+    /// balance or below. 0.10 = they've offloaded ≥90%.
+    #[serde(default = "default_mirror_close_fraction")]
+    pub mirror_close_fraction: f64,
+    /// In mirror mode, the safety backstop hold time (seconds) — force-sell if
+    /// the alpha never closes within this window. Replaces `max_hold_secs` while
+    /// mirror_exit is on. 0 = hold indefinitely (only rug/SL/process-exit close).
+    #[serde(default = "default_mirror_max_hold_secs")]
+    pub mirror_max_hold_secs: u64,
+}
+
+fn default_mirror_exit() -> bool {
+    true
+}
+fn default_mirror_exit_on_first_sell() -> bool {
+    true
+}
+fn default_mirror_close_fraction() -> f64 {
+    0.10
+}
+fn default_mirror_max_hold_secs() -> u64 {
+    7200
 }
 
 impl Default for CopyTradeConfig {
@@ -78,6 +147,10 @@ impl Default for CopyTradeConfig {
             stop_loss_pct: 20.0,
             trail_tiers: "20:6,40:10,75:15,100:20,150:25,200:30".to_string(),
             take_profit_pct: 300.0,
+            mirror_exit: default_mirror_exit(),
+            mirror_exit_on_first_sell: default_mirror_exit_on_first_sell(),
+            mirror_close_fraction: default_mirror_close_fraction(),
+            mirror_max_hold_secs: default_mirror_max_hold_secs(),
         }
     }
 }

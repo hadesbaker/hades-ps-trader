@@ -1,4 +1,4 @@
-use crate::config::BoxError;
+use crate::config::{BoxError, JitoConfig};
 use log::{error, info, warn};
 use serde_json::{json, Value};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -8,11 +8,34 @@ use solana_sdk::message::VersionedMessage;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::TransactionConfirmationStatus;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
 const TRADE_LOCAL_URL: &str = "https://pumpportal.fun/api/trade-local";
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Process-global Jito settings, set once at startup via [`init_jito`]. `Some`
+/// only when `[jito].enabled = true`; otherwise trades go via plain RPC send.
+/// Global (vs threaded through every `BuyParams`) because `enabled`/url/tip are
+/// process-wide, keeping the many call sites untouched.
+static JITO: OnceLock<Option<JitoConfig>> = OnceLock::new();
+
+/// Initialize Jito submission from config. Call once at startup before trading.
+pub fn init_jito(cfg: &JitoConfig) {
+    let settings = if cfg.enabled { Some(cfg.clone()) } else { None };
+    if let Some(s) = &settings {
+        info!(
+            "JITO bundle submission ENABLED — tip={} SOL, engine={}",
+            s.tip_sol, s.block_engine_url
+        );
+    }
+    let _ = JITO.set(settings);
+}
+
+fn jito_settings() -> Option<&'static JitoConfig> {
+    JITO.get().and_then(|o| o.as_ref())
+}
 
 // Slippage escalation: on tx failure, retry with a higher slippage tolerance.
 // `submit` (HTTP + sign + send + confirm) is treated as one atomic attempt;
@@ -150,6 +173,24 @@ async fn submit(
         return Ok(None);
     }
 
+    // Jito path: submit the trade as a single-tx bundle for atomic, fast
+    // (single-block) landing. Only a send-side failure (trade-local / sendBundle
+    // HTTP error) falls back to RPC — a confirm timeout AFTER a successful bundle
+    // send does NOT fall back, to avoid double-executing a trade that may have
+    // landed (matches the RPC path's confirm-timeout-is-terminal behavior).
+    if let Some(j) = jito_settings() {
+        match send_bundle(http, rpc, keypair, body, action, &label, j).await {
+            Ok(sig) => {
+                info!("{action} {label}: jito bundle submitted: {sig}");
+                confirm(rpc, &sig, action).await?;
+                return Ok(Some(sig));
+            }
+            Err(e) => warn!(
+                "{action} {label}: jito bundle send failed ({e}); falling back to RPC send"
+            ),
+        }
+    }
+
     info!("POST trade-local {action} {label}");
     let resp = http.post(TRADE_LOCAL_URL).json(body).send().await?;
     let status = resp.status();
@@ -198,6 +239,102 @@ async fn submit(
 
     confirm(rpc, &sig, action).await?;
     Ok(Some(sig))
+}
+
+/// Submit the trade as a single-tx Jito bundle. Requests the trade-local tx in
+/// ARRAY form (PumpPortal uses the first tx's priorityFee as the Jito tip and
+/// builds the tip transfer in), signs it with a fresh blockhash, base58-encodes
+/// it, and POSTs a `sendBundle` JSON-RPC to the block engine. Returns the tx
+/// signature once the engine accepts the bundle. Any HTTP / encoding error is
+/// returned so the caller can fall back to a plain RPC send.
+async fn send_bundle(
+    http: &reqwest::Client,
+    rpc: &RpcClient,
+    keypair: &Keypair,
+    body: &Value,
+    action: &str,
+    label: &str,
+    jito: &JitoConfig,
+) -> Result<Signature, BoxError> {
+    // Array request; the tip is paid via the first tx's priorityFee in bundle mode.
+    let mut tx_body = body.clone();
+    tx_body["priorityFee"] = json!(jito.tip_sol);
+    let arr = Value::Array(vec![tx_body]);
+
+    info!("POST trade-local (jito array) {action} {label}");
+    let resp = http.post(TRADE_LOCAL_URL).json(&arr).send().await?;
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    if !status.is_success() {
+        return Err(format!(
+            "trade-local (jito) HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+        .into());
+    }
+    // Array response: a JSON array of base58-encoded unsigned txs.
+    let encoded: Vec<String> = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "jito trade-local response not a base58 tx array ({e}): {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })?;
+    if encoded.is_empty() {
+        return Err("jito trade-local returned an empty tx array".into());
+    }
+
+    let fresh = rpc.get_latest_blockhash().await?;
+    let mut signed_b58: Vec<String> = Vec::with_capacity(encoded.len());
+    let mut first_sig: Option<Signature> = None;
+    for enc in &encoded {
+        let raw = bs58::decode(enc)
+            .into_vec()
+            .map_err(|e| format!("jito tx base58 decode: {e}"))?;
+        let unsigned: VersionedTransaction = bincode::deserialize(&raw)
+            .map_err(|e| format!("jito tx deserialize ({} bytes): {e}", raw.len()))?;
+        let mut message = unsigned.message;
+        match &mut message {
+            VersionedMessage::Legacy(m) => m.recent_blockhash = fresh,
+            VersionedMessage::V0(m) => m.recent_blockhash = fresh,
+        }
+        let signed = VersionedTransaction {
+            signatures: vec![keypair.sign_message(&message.serialize())],
+            message,
+        };
+        if first_sig.is_none() {
+            first_sig = Some(signed.signatures[0]);
+        }
+        let ser =
+            bincode::serialize(&signed).map_err(|e| format!("jito signed tx serialize: {e}"))?;
+        signed_b58.push(bs58::encode(ser).into_string());
+    }
+
+    let bundle_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendBundle",
+        "params": [signed_b58],
+    });
+    let jresp = http.post(&jito.block_engine_url).json(&bundle_req).send().await?;
+    let jstatus = jresp.status();
+    let jbytes = jresp.bytes().await?;
+    if !jstatus.is_success() {
+        return Err(format!(
+            "sendBundle HTTP {jstatus}: {}",
+            String::from_utf8_lossy(&jbytes)
+        )
+        .into());
+    }
+    let jval: Value = serde_json::from_slice(&jbytes).map_err(|e| {
+        format!(
+            "sendBundle response parse ({e}): {}",
+            String::from_utf8_lossy(&jbytes)
+        )
+    })?;
+    if let Some(err) = jval.get("error") {
+        return Err(format!("sendBundle error: {err}").into());
+    }
+    first_sig.ok_or_else(|| "jito bundle produced no signature".into())
 }
 
 async fn confirm(rpc: &RpcClient, sig: &Signature, action: &str) -> Result<(), BoxError> {
